@@ -138,7 +138,7 @@ test("renders imported parameter declarations without HTML injection", async ({ 
 test("shows progress only while an OpenDRIVE map is loading", async ({ page }) => {
   await openScenario(page);
   let releaseUpload;
-  await page.route("**/api/map", async (route) => {
+  await page.route(/\/api\/map(?:\?.*)?$/, async (route) => {
     await new Promise((resolve) => { releaseUpload = resolve; });
     await route.abort();
   });

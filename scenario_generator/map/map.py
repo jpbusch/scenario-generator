@@ -285,6 +285,7 @@ class ScenarioMap:
     path: Path | None = None
     modified: bool = False
     edit_enabled: bool = False
+    revision: int = 0
     _elevation_cells: (
         dict[
             tuple[int, int],
@@ -430,17 +431,38 @@ class ScenarioMap:
         compatible_types = self.COMPATIBLE_LANE_TYPES.get(
             actor_type, self.COMPATIBLE_LANE_TYPES["vehicle"]
         )
+        if self._elevation_cells is None:
+            self.rebuild_elevation_index()
+        candidates = {}
+        min_cell_x = math.floor((x_m - max_distance_m) / self.ELEVATION_GRID_SIZE_M)
+        max_cell_x = math.floor((x_m + max_distance_m) / self.ELEVATION_GRID_SIZE_M)
+        min_cell_y = math.floor((y_m - max_distance_m) / self.ELEVATION_GRID_SIZE_M)
+        max_cell_y = math.floor((y_m + max_distance_m) / self.ELEVATION_GRID_SIZE_M)
+        cell_count = (max_cell_x - min_cell_x + 1) * (max_cell_y - min_cell_y + 1)
+        cells = (
+            (cell for cell in self._elevation_cells
+             if min_cell_x <= cell[0] <= max_cell_x and min_cell_y <= cell[1] <= max_cell_y)
+            if cell_count > len(self._elevation_cells) else
+            ((cell_x, cell_y) for cell_x in range(min_cell_x, max_cell_x + 1)
+             for cell_y in range(min_cell_y, max_cell_y + 1))
+        )
+        for cell in cells:
+            for road, start, end in self._elevation_cells.get(cell, []):
+                candidates.setdefault(id(road), {})[id(start), id(end)] = (start, end)
         best: tuple[float, LaneSnapResult] | None = None
         for road in self.display_roads:
             if road.kind != "reference":
                 continue
             if len(road.lane_cross_sections) >= 2:
+                if id(road) not in candidates:
+                    continue
                 best = self._nearest_imported_lane(
                     road,
                     x_m,
                     y_m,
                     compatible_types,
                     best,
+                    list(candidates[id(road)].values()),
                 )
             else:
                 best = self._nearest_synthetic_lane(
@@ -461,9 +483,10 @@ class ScenarioMap:
         y_m: float,
         compatible_types: frozenset[str],
         best: tuple[float, LaneSnapResult] | None,
+        profile_pairs=None,
     ) -> tuple[float, LaneSnapResult] | None:
         """Return the closest compatible imported lane centerline on one road."""
-        for start, end in zip(road.lane_cross_sections, road.lane_cross_sections[1:]):
+        for start, end in profile_pairs if profile_pairs is not None else zip(road.lane_cross_sections, road.lane_cross_sections[1:]):
             lane_ids = set(start.lane_widths_m) & set(end.lane_widths_m)
             for lane_id in lane_ids:
                 lane_type = start.lane_types.get(
@@ -563,6 +586,7 @@ class ScenarioMap:
         return best
 
     def load_view_only(self, roads: list[MapPolyline], path: Path | None):
+        self.revision += 1
         self.view_roads = self.clone_polylines(roads)
         self.roads = []
         self.path = path
@@ -571,6 +595,7 @@ class ScenarioMap:
         self._elevation_cells = None
 
     def load_editable(self, roads: list[MapPolyline], path: Path | None):
+        self.revision += 1
         self.roads = self.clone_polylines(roads)
         self.view_roads = []
         self.path = path
@@ -582,14 +607,15 @@ class ScenarioMap:
         if self.edit_enabled:
             return False
         if self.view_roads:
+            self.revision += 1
             self.roads = self.clone_polylines(self.view_roads)
             self.edit_enabled = True
-            self.modified = False
             self._elevation_cells = None
             return True
         return False
 
     def clear(self):
+        self.revision += 1
         self.roads = []
         self.view_roads = []
         self.path = None
@@ -643,7 +669,8 @@ class ScenarioMap:
         self._elevation_cells = cells
 
     def invalidate_elevation_index(self):
-        """Discard cached road-surface segments after map edits."""
+        """Discard cached map-derived data after map edits."""
+        self.revision += 1
         self._elevation_cells = None
 
     def elevation_at(self, x_m: float, y_m: float) -> float | None:

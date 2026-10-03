@@ -5,8 +5,8 @@ import re
 from dataclasses import dataclass, field
 
 from scenario_generator.config.settings import load_actor_dimensions
-from scenario_generator.geometry_utils import interpolate_angle, interpolate_series
-from scenario_generator.scenario_elements.road_user.trajectory import Trajectory, Waypoint
+from scenario_generator.geometry_utils import interpolate_series
+from scenario_generator.scenario_elements.road_user.trajectory import Trajectory, Waypoint, interpolate_trajectory
 
 
 @dataclass
@@ -116,28 +116,17 @@ def actor_state_from_trajectory(
 ) -> ActorState:
     """Interpolate a trajectory into an :class:`ActorState` at ``time_s``."""
     time_values = [float(value) for value in trajectory["time_s"]]
+    x, y, yaw = interpolate_trajectory(trajectory, time_s)
     return ActorState(
         name=name,
-        x_m=interpolate_series(
-            time_values,
-            [float(value) for value in trajectory["x_m"]],
-            time_s,
-        ),
-        y_m=interpolate_series(
-            time_values,
-            [float(value) for value in trajectory["y_m"]],
-            time_s,
-        ),
+        x_m=x,
+        y_m=y,
         speed_mps=interpolate_series(
             time_values,
             [float(value) for value in trajectory["speed_mps"]],
             time_s,
         ),
-        yaw_rad=interpolate_angle(
-            time_values,
-            [float(value) for value in trajectory["yaw_rad"]],
-            time_s,
-        ),
+        yaw_rad=yaw,
         collision_radius_m=collision_radius(dimensions),
         length_m=dimensions.length_m,
         width_m=dimensions.width_m,

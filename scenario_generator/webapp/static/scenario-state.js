@@ -95,14 +95,31 @@ async function api(path, options = {}, parseJson = true) {
   }
   // Serialize mutations so an older browser request cannot overwrite a newer one.
   const request = async () => {
-    const response = await fetch(path, options);
+    const compact = path === "/api/scenario" || method !== "GET";
+    const requestPath = compact ? `${path}${path.includes("?") ? "&" : "?"}compact=true` : path;
+    const response = await fetch(requestPath, options);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || response.statusText);
     }
-    return parseJson && response.headers.get("content-type")?.includes("application/json")
-      ? response.json()
-      : response;
+    if (!parseJson || !response.headers.get("content-type")?.includes("application/json")) return response;
+    const result = await response.json();
+    const snapshot = result.scenario || result;
+    if (snapshot.actors && snapshot.map) {
+      if (!snapshot.map.roads) {
+        if (state.scenario?.map.revision === snapshot.map.revision) {
+          snapshot.map = { ...state.scenario.map, ...snapshot.map };
+        } else {
+          const layers = await api(`/api/layers?revision=${snapshot.map.revision}`);
+          snapshot.map = layers.map;
+          state.lanelet = layers.lanelet;
+          state.layerIndex = null;
+        }
+      }
+      state.scenario = snapshot;
+      state.freshSnapshot = method !== "GET";
+    }
+    return result;
   };
   if ((options.method || "GET").toUpperCase() === "GET") return request();
   const pending = mutationQueue.then(request, request);
@@ -112,7 +129,8 @@ async function api(path, options = {}, parseJson = true) {
 
 /** Reload authoritative state while retaining a still-valid actor selection. */
 async function refresh(selectName) {
-  state.scenario = await api("/api/scenario");
+  if (!state.freshSnapshot) state.scenario = await api("/api/scenario");
+  state.freshSnapshot = false;
   state.selected = selectName || state.selected || state.scenario.actors[0]?.name;
   if (!state.scenario.actors.some((actor) => actor.name === state.selected)) {
     state.selected = state.scenario.actors[0]?.name;
@@ -157,6 +175,7 @@ function render() {
   renderDetectionGaps();
   renderMode();
   renderAdditionalInformation();
+  if (typeof renderGeodata === "function") renderGeodata();
   draw();
   applyTooltips();
   updateCanvasSummary();
@@ -463,7 +482,9 @@ function renderPoints() {
   const body = $("#waypoint-body");
   body.replaceChildren();
   if (!actor) return;
-  actor.waypoints.forEach((point, index) => {
+  const start = tablePage(body, actor.waypoints.length, "actor:" + actor.name, renderPoints);
+  actor.waypoints.slice(start, start + 100).forEach((point, localIndex) => {
+    const index = start + localIndex;
     const row = document.createElement("tr");
     row.innerHTML = `<td><button id="waypoint-${index}-insert" type="button" class="insert" aria-label="Insert (+) trajectory point before point ${index + 1}">+</button><button id="waypoint-${index}-remove" type="button" class="remove" aria-label="Remove (−) trajectory point ${index + 1}">−</button></td>` +
       ["time_s", "x_m", "y_m", "speed_mps"]
@@ -664,4 +685,25 @@ function additionalInformation() {
     postprocessing_parameters: [...document.querySelectorAll("#postprocessing-parameters [data-script-parameter]")].reduce((result, input) => ({ ...result, [input.dataset.script]: { ...result[input.dataset.script], [input.dataset.scriptParameter]: input.value } }), {}),
     ...(environment ? { environment } : {}),
   };
+}
+
+/** Bound DOM work while retaining direct access to every point by page number. */
+function tablePage(body, count, key, rerender) {
+  state.tablePages ||= {};
+  const pageCount = Math.max(1, Math.ceil(count / 100));
+  const page = Math.min(state.tablePages[key] || 0, pageCount - 1);
+  state.tablePages[key] = page;
+  let controls = body.closest("table").previousElementSibling;
+  if (!controls?.classList.contains("table-pager")) {
+    controls = document.createElement("div");
+    controls.className = "table-pager";
+    body.closest("table").before(controls);
+  }
+  controls.replaceChildren(); controls.hidden = count <= 100;
+  const input = document.createElement("input"); input.type = "number";
+  input.min = 1; input.max = pageCount; input.value = page + 1;
+  input.setAttribute("aria-label", "Point table page");
+  input.onchange = () => { state.tablePages[key] = Math.max(0, Math.min(pageCount - 1, Number(input.value) - 1)); rerender(); };
+  controls.append("Page ", input, ` of ${pageCount} (${count} points)`);
+  return page * 100;
 }

@@ -213,7 +213,7 @@ def test_scenario_config_roundtrip_preserves_dimensions_map_and_gaps(tmp_path):
     assert loaded_map == tmp_path / "map.xodr"
     assert loaded_gaps == gaps
     config = json.loads(path.read_text(encoding="utf-8"))
-    assert config["version"] == 4
+    assert config["version"] == 5
     assert "trajectory_creation_mode" not in config
 
 

@@ -278,6 +278,47 @@
           </div>
         </div>
         <hr />
+        <details id="geographic-layers" class="additional-info">
+          <summary>Geographic layers</summary>
+          <button id="lanelet-load" type="button">Import Lanelet2 (.osm)</button>
+          <input id="lanelet-upload" class="visually-hidden" type="file" accept=".osm" aria-label="Choose Lanelet2 map" tabindex="-1" />
+          <button id="lanelet-remove" type="button">Remove Lanelet2</button>
+          <label class="check-label"><input id="show-lanelet" type="checkbox" /><span>Lanelet2 boundaries and centerlines</span></label>
+          <label class="check-label"><input id="show-orthophoto" type="checkbox" /><span>NRW orthophotos</span></label>
+          <label>Orthophoto opacity<input id="orthophoto-opacity" type="range" min="0" max="1" step="0.05" /></label>
+          <label>XODR opacity<input id="map-opacity" type="range" min="0" max="1" step="0.05" /></label>
+          <label class="check-label"><input id="show-origins" type="checkbox" /><span>Coordinate origins</span></label>
+          <p id="georeference-summary"></p>
+          <p id="imagery-status" role="status" aria-live="polite"></p>
+          <a href="https://www.bezreg-koeln.nrw.de/geobasis-nrw" target="_blank" rel="noopener noreferrer">Orthophotos: Geobasis NRW, Land NRW</a>
+          <details><summary>Set map georeference</summary>
+            <label>Projected CRS<input id="frame-crs" placeholder="EPSG:25832 or PROJ definition" /></label>
+            <label>Projected origin X (m)<input id="frame-x" type="number" step="any" value="0" /></label>
+            <label>Projected origin Y (m)<input id="frame-y" type="number" step="any" value="0" /></label>
+            <label>Frame rotation (rad)<input id="frame-heading" type="number" step="any" value="0" /></label>
+            <button id="frame-apply" type="button">Apply georeference</button>
+          </details>
+        </details>
+        <details id="route-generator" class="additional-info">
+          <summary>Create vehicle route</summary>
+          <label>Routing map<select id="route-source"><option value="xodr">OpenDRIVE</option><option value="lanelet2">Lanelet2</option></select></label>
+          <label>Point coordinates<select id="route-coordinates"><option value="local">Local X / Y (m)</option><option value="geographic">Longitude / latitude</option></select></label>
+          <label>Start, optional via points, target<textarea id="route-points" rows="4" placeholder="One point per line: X, Y, optional lane ID"></textarea></label>
+          <p>Points follow lane direction. An optional lane ID selects a specific lane; the preview shows the matched lanes.</p>
+          <div class="button-row"><button id="route-pick-start" type="button">Pick start</button><button id="route-pick-via" type="button">Pick via</button><button id="route-pick-target" type="button">Pick target</button><button id="route-pick-cancel" type="button">Cancel picking</button></div>
+          <div class="route-profile-fields">
+            <label>Start time (s)<input id="route-start-time" type="number" min="0" step="0.1" value="0" /></label>
+            <label>Start speed (km/h)<input id="route-start-speed" type="number" min="0" step="1" value="30" /></label>
+            <label>End speed (km/h)<input id="route-end-speed" type="number" min="0" step="1" value="30" /></label>
+            <label>Reference speed (km/h)<input id="route-reference-speed" type="number" min="0.1" step="1" value="30" /></label>
+            <label>Acceleration (m/s²)<input id="route-acceleration" type="number" min="0.01" step="0.1" value="2" /></label>
+            <label>Braking (m/s²)<input id="route-deceleration" type="number" min="0.01" step="0.1" value="2" /></label>
+            <label>Sampling interval (s)<input id="route-dt" type="number" min="0.001" step="0.01" value="0.1" /></label>
+          </div>
+          <button id="route-preview" type="button">Preview route</button>
+          <button id="route-apply" type="button" disabled>Use route for selected actor</button>
+          <p id="route-summary" role="status" aria-live="polite"></p>
+        </details>
         <details class="additional-info">
           <summary>Additional scenario information</summary>
           <label>
@@ -603,6 +644,7 @@
     <script src="/assets/parameter-dialog.js"></script>
     <script src="/assets/file-exports.js"></script>
     <script src="/assets/map-editor.js"></script>
+    <script src="/assets/geographic-layers.js"></script>
     <script src="/assets/runtime-controls.js"></script>
   </body>
 </html>

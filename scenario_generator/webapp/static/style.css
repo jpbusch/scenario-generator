@@ -1128,3 +1128,10 @@ dialog::backdrop {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Geographic tools use the existing sidebar form and disclosure styles. */
+#georeference-summary, #route-summary { overflow-wrap: anywhere; font-size: 0.85rem; }
+.route-profile-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+#route-points { width: 100%; box-sizing: border-box; }
+.table-pager { display: flex; align-items: center; gap: 8px; padding: 8px; }
+.table-pager input { width: 65px; }

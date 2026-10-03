@@ -2,10 +2,7 @@
 
 /** Use the latest actor waypoint as playback's natural upper time bound. */
 function scenarioEndTime() {
-  const waypointTimes = state.scenario.actors.flatMap((actor) => (
-    actor.waypoints.map((point) => point.time_s)
-  ));
-  return Math.max(1, ...waypointTimes);
+  return state.scenario.actors.reduce((end, actor) => Math.max(end, actor.waypoints.at(-1)?.time_s || 0), 1);
 }
 /** Return the exact playback time, including endpoints between slider steps. */
 function currentPlaybackTime() {

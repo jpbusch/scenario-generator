@@ -1,6 +1,9 @@
 services:
   scenario.generator-web:
     image: ${SCENARIO_GENERATOR_IMAGE:-local/scenario-generator:latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     working_dir: /app
     command: python -m scenario_generator.webapp.server
     environment:
@@ -11,9 +14,11 @@ services:
       SCENARIO_GENERATOR_SESSION_COOKIE_PATH: ${SCENARIO_GENERATOR_SESSION_COOKIE_PATH:-/}
       SCENARIO_GENERATOR_SESSION_CLEANUP_INTERVAL_SECONDS: ${SCENARIO_GENERATOR_SESSION_CLEANUP_INTERVAL_SECONDS:-300}
       SCENARIO_GENERATOR_SESSION_TTL_SECONDS: ${SCENARIO_GENERATOR_SESSION_TTL_SECONDS:-86400}
+      SCENARIO_GENERATOR_ORTHOPHOTO_CACHE: /tmp/scenario.generator/orthophotos
     user: "${DOCKER_UID:-0}:${DOCKER_GID:-0}"
     volumes:
       - ..:/app
+      - orthophoto-cache:/tmp/scenario.generator/orthophotos
     ports:
       - "8000:8000"
     cpus: ${SCENARIO_GENERATOR_CPU_LIMIT:-2.0}
@@ -21,3 +26,6 @@ services:
     pids_limit: ${SCENARIO_GENERATOR_PIDS_LIMIT:-256}
     tty: true
     stdin_open: true
+
+volumes:
+  orthophoto-cache:

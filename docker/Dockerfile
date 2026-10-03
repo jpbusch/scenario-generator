@@ -31,7 +31,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/scenario-generator-venv /opt/scenario-generator-venv
+RUN mkdir -p /tmp/scenario.generator/orthophotos \
+    && chmod 1777 /tmp/scenario.generator /tmp/scenario.generator/orthophotos
 COPY LICENSE LICENSE-3rdparty /app/
 COPY scenario_generator /app/scenario_generator
 

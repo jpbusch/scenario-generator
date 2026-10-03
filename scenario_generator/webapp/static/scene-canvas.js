@@ -5,19 +5,16 @@ function viewport() {
   // A manual camera survives redraws; otherwise derive a fit-to-content camera.
   const canvas = $("#map-canvas");
   const rect = canvas.getBoundingClientRect();
-  canvas.width = rect.width * devicePixelRatio;
-  canvas.height = rect.height * devicePixelRatio;
-  const points = [
-    ...state.scenario.map.roads.flatMap((road) => road.points),
-    ...state.scenario.actors.flatMap((actor) => actor.waypoints.map((point) => [point.x_m, point.y_m])),
-  ];
+  const width = Math.round(rect.width * devicePixelRatio), height = Math.round(rect.height * devicePixelRatio);
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  if (state.camera) return { canvas, ...state.camera };
+  const bounds = state.scenario.map.bounds;
+  const points = state.scenario.actors.flatMap((actor) => actor.waypoints.map((point) => [point.x_m, point.y_m]));
+  if (bounds) points.push([bounds[0], bounds[1]], [bounds[2], bounds[3]]);
+  else if (state.laneletBounds) points.push([state.laneletBounds[0], state.laneletBounds[1]], [state.laneletBounds[2], state.laneletBounds[3]]);
   if (!points.length || rect.width <= 1 || rect.height <= 1) return { canvas, minX: -10, minY: -10, scale: 18 };
-  const xs = points.map((point) => point[0]);
-  const ys = points.map((point) => point[1]);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const point of points) { minX = Math.min(minX, point[0]); maxX = Math.max(maxX, point[0]); minY = Math.min(minY, point[1]); maxY = Math.max(maxY, point[1]); }
   const spanX = Math.max(maxX - minX, 8);
   const spanY = Math.max(maxY - minY, 8);
   const margin = 48;
@@ -38,6 +35,7 @@ function viewport() {
 
 /** Stroke world-coordinate points using the current camera transform. */
 function drawPolyline(context, points, transform) {
+  if (transform.view) { drawWorldPath(context, points, transform); return; }
   context.beginPath();
   points.forEach((point, index) => {
     const transformed = transform(point);
@@ -151,13 +149,20 @@ function positionAt(actor, timeS) {
   const curve = actor.curve;
   if (!curve?.time_s?.length) return null;
   if (timeS <= curve.time_s[0]) return [curve.x_m[0], curve.y_m[0], curve.yaw_rad[0]];
-  for (let index = 1; index < curve.time_s.length; index += 1) {
+  let low = 1, high = curve.time_s.length - 1;
+  while (low < high) { const middle = (low + high) >> 1; if (curve.time_s[middle] < timeS) low = middle + 1; else high = middle; }
+  for (let index = low; index <= low; index += 1) {
     if (timeS <= curve.time_s[index]) {
       const previous = index - 1;
       const span = curve.time_s[index] - curve.time_s[previous];
       const fraction = span ? (timeS - curve.time_s[previous]) / span : 0;
-      const xM = curve.x_m[previous] + (curve.x_m[index] - curve.x_m[previous]) * fraction;
-      const yM = curve.y_m[previous] + (curve.y_m[index] - curve.y_m[previous]) * fraction;
+      let progress = fraction;
+      if (actor.trajectory_options?.interpolation_mode === "kinematic") {
+        const v0 = curve.speed_mps[previous], v1 = curve.speed_mps[index];
+        if (v0 + v1 > 1e-9) progress = (2 * v0 * fraction + (v1 - v0) * fraction ** 2) / (v0 + v1);
+      }
+      const xM = curve.x_m[previous] + (curve.x_m[index] - curve.x_m[previous]) * progress;
+      const yM = curve.y_m[previous] + (curve.y_m[index] - curve.y_m[previous]) * progress;
       let yawDelta = curve.yaw_rad[index] - curve.yaw_rad[previous];
       while (yawDelta > Math.PI) yawDelta -= 2 * Math.PI;
       while (yawDelta < -Math.PI) yawDelta += 2 * Math.PI;
@@ -178,18 +183,51 @@ function trajectoryActiveAt(actor, timeS) {
 }
 
 /** Project the complete scenario state; the canvas itself owns no geometry. */
+let scheduledDraw = null;
 function draw() {
+  if (scheduledDraw !== null) return;
+  scheduledDraw = requestAnimationFrame(() => { scheduledDraw = null; drawScene(); });
+}
+function drawScene() {
   if (!state.scenario) return;
   state.labelTargets = [];
   const view = viewport();
-  const context = view.canvas.getContext("2d");
-  context.scale(devicePixelRatio, devicePixelRatio);
+  let context = view.canvas.getContext("2d");
+  context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
   context.clearRect(0, 0, view.canvas.width, view.canvas.height);
   const maxY = view.minY + view.canvas.height / devicePixelRatio / view.scale;
-  const transform = (point) => [(point[0] - view.minX) * view.scale, (maxY - point[1]) * view.scale];
+  let transform = (point) => [(point[0] - view.minX) * view.scale, (maxY - point[1]) * view.scale];
+  transform.view = view;
   context.lineCap = "round";
   drawGrid(context, view, transform);
-  const drawableRoads = [...state.scenario.map.roads].sort((first, second) => Number(["outer", "section"].includes(first.kind)) - Number(["outer", "section"].includes(second.kind)));
+  if (typeof drawOrthophotos === "function") drawOrthophotos(context, view, transform);
+  const mainContext = context;
+  const mainTransform = transform;
+  const mapKey = JSON.stringify([state.scenario.map.revision, view.canvas.width, view.canvas.height,
+    ...["show_map", "show_map_helpers", "show_road_centerlines", "show_lane_numbers", "show_road_points", "show_lanelet", "show_origins", "map_opacity"].map((key) => state.scenario.settings[key])]);
+  const raster = state.mapRaster;
+  const visibleMaxX = view.minX + view.canvas.width / devicePixelRatio / view.scale;
+  const contained = raster && view.minX >= raster.minX && view.minY >= raster.minY && visibleMaxX <= raster.maxX && maxY <= raster.maxY;
+  const zoomRatio = raster ? view.scale / raster.scale : 1;
+  // Reuse nearby zoom levels while scrolling, then restore exact pixel detail.
+  if (zoomRatio !== 1 && state.lastMapViewScale !== view.scale) {
+    clearTimeout(state.mapZoomTimer);
+    state.mapZoomTimer = setTimeout(() => { state.staticMapKey = null; draw(); }, 120);
+  }
+  state.lastMapViewScale = view.scale;
+  if (mapKey !== state.staticMapKey || !contained || zoomRatio < 0.8 || zoomRatio > 1.25 || state.dragTarget?.kind === "road") {
+    const layer = state.staticMapCanvas ||= document.createElement("canvas");
+    layer.width = Math.ceil(view.canvas.width * 1.5); layer.height = Math.ceil(view.canvas.height * 1.5);
+    const mapView = { canvas: layer, minX: view.minX - view.canvas.width / devicePixelRatio / view.scale / 4,
+      minY: view.minY - view.canvas.height / devicePixelRatio / view.scale / 4, scale: view.scale };
+    const mapMaxY = mapView.minY + layer.height / devicePixelRatio / view.scale;
+    state.mapRaster = { ...mapView, maxY: mapMaxY, maxX: mapView.minX + layer.width / devicePixelRatio / view.scale };
+    transform = (point) => [(point[0] - mapView.minX) * view.scale, (mapMaxY - point[1]) * view.scale]; transform.view = mapView;
+    context = layer.getContext("2d"); context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    context.lineCap = "round";
+    const firstLabel = state.labelTargets.length;
+    context.globalAlpha = state.scenario.settings.map_opacity ?? 1;
+  const drawableRoads = visibleLayerItems("roads", state.scenario.map.roads, mapView).sort((first, second) => Number(["outer", "section"].includes(first.kind)) - Number(["outer", "section"].includes(second.kind)));
   drawableRoads.forEach((road) => {
     if (!state.scenario.settings.show_map) return;
     if (["outer", "section"].includes(road.kind) && !state.scenario.settings.show_map_helpers) return;
@@ -197,16 +235,11 @@ function draw() {
     const laneColors = { driving: "#434a4f", biking: "#86b6d1", sidewalk: "#d8d8d8", walking: "#d8d8d8", pedestrian: "#d8d8d8", parking: "#9da4a8", default: "#69746d" };
     if (geometry?.lanes?.length) {
       geometry.lanes.forEach((lane) => {
-        const points = lane.points.map(transform);
-        if (points.length < 3) return;
+        if (lane.points.length < 3) return;
         context.fillStyle = laneColors[lane.type] || laneColors.default;
         context.strokeStyle = "#526579";
         context.lineWidth = 1;
-        context.beginPath();
-        points.forEach((point, index) => index ? context.lineTo(...point) : context.moveTo(...point));
-        context.closePath();
-        context.fill();
-        context.stroke();
+        drawWorldPath(context, lane.points, transform, true, true);
       });
     } else {
       const helperStyle = road.kind === "outer"
@@ -234,6 +267,17 @@ function draw() {
     if (geometry?.labels?.length && state.scenario.settings.show_lane_numbers) geometry.labels.forEach((label) => { const point = transform([label.x_m, label.y_m]); drawLabel(context, point[0], point[1], String(label.id), "#25313a"); });
     if (state.scenario.settings.show_road_points && road.kind === "reference") road.points.forEach((point, index) => { const transformed = transform(point); context.fillStyle = "#eb5e28"; context.beginPath(); context.arc(...transformed, 4, 0, Math.PI * 2); context.fill(); drawLabel(context, transformed[0] + 12, transformed[1], String(index + 1), "#7a4a18"); });
   });
+    context.globalAlpha = 1;
+    if (typeof drawGeographicLayers === "function") drawGeographicLayers(context, mapView, transform);
+    state.staticMapLabels = state.labelTargets.splice(firstLabel);
+    state.staticMapKey = mapKey;
+  }
+  context = mainContext; transform = mainTransform;
+  const [mapX, mapY] = transform([state.mapRaster.minX, state.mapRaster.maxY]);
+  const mapScale = view.scale / state.mapRaster.scale;
+  context.drawImage(state.staticMapCanvas, mapX, mapY, state.staticMapCanvas.width / devicePixelRatio * mapScale, state.staticMapCanvas.height / devicePixelRatio * mapScale);
+  state.labelTargets.push(...(state.staticMapLabels || []).map((label) => ({ ...label, x: label.x * mapScale + mapX, y: label.y * mapScale + mapY, width: label.width * mapScale, height: label.height * mapScale })));
+  if (typeof drawRoutePreview === "function") drawRoutePreview(context, transform);
   if (state.scenario.settings.show_road_connections) {
     const roadsByName = new Map(state.scenario.map.roads.map((road) => [road.name, road]));
     state.scenario.map.roads.forEach((road) => {
@@ -274,7 +318,9 @@ function draw() {
     }
     if (state.scenario.settings.show_trajectory_waypoints) {
       actor.waypoints.forEach((point, index) => {
+        if (actor.waypoints.length > 200 && index % Math.ceil(actor.waypoints.length / 200) !== 0 && index !== actor.waypoints.length - 1) return;
         const transformed = transform([point.x_m, point.y_m]);
+        if (transformed[0] < -60 || transformed[1] < -60 || transformed[0] > view.canvas.width / devicePixelRatio + 60 || transformed[1] > view.canvas.height / devicePixelRatio + 60) return;
         drawWaypointHandle(context, transformed, color, actor.name === state.selected);
         if (state.scenario.settings.show_point_indices) drawPointIndex(context, transformed[0], transformed[1], index + 1);
         if (state.scenario.settings.show_waypoint_times) drawLabel(context, transformed[0] + 26, transformed[1] + 12, `t=${point.time_s.toFixed(2)}s`, color, { kind: "time", actorName: actor.name, index });
@@ -282,6 +328,7 @@ function draw() {
       });
     }
     if (state.scenario.settings.show_segment_average_speeds) actor.segment_speeds_mps.forEach((speed, index) => {
+      if (actor.waypoints.length > 200 && index % Math.ceil(actor.waypoints.length / 200) !== 0) return;
       const midpoint = actor.segment_midpoints[index] || [(actor.waypoints[index].x_m + actor.waypoints[index + 1].x_m) / 2, (actor.waypoints[index].y_m + actor.waypoints[index + 1].y_m) / 2];
       const transformed = transform(midpoint); drawLabel(context, transformed[0], transformed[1] - 14, `${speed.toFixed(2)} m/s`, color, { kind: "segment", actorName: actor.name, index });
     });
@@ -445,6 +492,7 @@ async function editCanvasLabel(target) {
 
 /** Apply the active canvas tool at an exact world coordinate for pointer and keyboard users. */
 async function activateCanvasPoint(x_m, y_m) {
+  if (state.routePick) { pickRoutePoint(x_m, y_m); return; }
   const actor = selectedActor();
   if (!actor) return;
   const view = state.view;
@@ -857,3 +905,48 @@ $("#add-point").onclick = () => {
   const actor = selectedActor();
   if (actor) insertWaypoint(actor.waypoints.length);
 };
+
+/** Grid-index immutable layer bounds once per layer revision. */
+function visibleLayerItems(key, items, view) {
+  state.layerIndex ||= {};
+  if (!state.layerIndex[key] || state.layerIndex[key].items !== items) {
+    const cells = new Map();
+    for (const item of items) {
+      const points = item.render_geometry?.lanes?.flatMap((lane) => lane.points) || item.points;
+      let xmin = Infinity, ymin = Infinity, xmax = -Infinity, ymax = -Infinity;
+      for (const [x, y] of points) { xmin = Math.min(xmin, x); ymin = Math.min(ymin, y); xmax = Math.max(xmax, x); ymax = Math.max(ymax, y); }
+      const pad = item.width_m || 1;
+      for (let x = Math.floor((xmin - pad) / 100); x <= Math.floor((xmax + pad) / 100); x += 1) {
+        for (let y = Math.floor((ymin - pad) / 100); y <= Math.floor((ymax + pad) / 100); y += 1) {
+          const cell = `${x}:${y}`; if (!cells.has(cell)) cells.set(cell, []); cells.get(cell).push(item);
+        }
+      }
+    }
+    state.layerIndex[key] = { items, cells };
+  }
+  const found = new Set(), cells = state.layerIndex[key].cells;
+  const xmax = view.minX + view.canvas.width / devicePixelRatio / view.scale, ymax = view.minY + view.canvas.height / devicePixelRatio / view.scale;
+  for (let x = Math.floor(view.minX / 100); x <= Math.floor(xmax / 100); x += 1) {
+    for (let y = Math.floor(view.minY / 100); y <= Math.floor(ymax / 100); y += 1) for (const item of cells.get(`${x}:${y}`) || []) found.add(item);
+  }
+  return [...found];
+}
+
+const worldPaths = new WeakMap();
+/** Keep precise vector paths in world coordinates so panning never rebuilds vertices. */
+function drawWorldPath(context, points, transform, close = false, fill = false) {
+  let cached = worldPaths.get(points);
+  if (!cached || state.dragTarget?.kind === "road") {
+    const path = new Path2D();
+    points.forEach(([x, y], index) => index ? path.lineTo(x, y) : path.moveTo(x, y));
+    cached = { open: path, closed: new Path2D(path) }; cached.closed.closePath(); worldPaths.set(points, cached);
+  }
+  const view = transform.view, top = view.minY + view.canvas.height / devicePixelRatio / view.scale;
+  context.save();
+  context.setTransform(devicePixelRatio * view.scale, 0, 0, -devicePixelRatio * view.scale, -view.minX * devicePixelRatio * view.scale, top * devicePixelRatio * view.scale);
+  context.lineWidth /= view.scale;
+  context.setLineDash(context.getLineDash().map((value) => value / view.scale));
+  const path = close ? cached.closed : cached.open;
+  if (fill) context.fill(path);
+  context.stroke(path); context.restore();
+}

@@ -180,7 +180,9 @@ async function saveRoad(sourceField = null) {
 function renderRoadPoints() {
   const body = $("#road-body"); body.replaceChildren();
   const road = state.scenario.map.roads[selectedRoadIndex()]; if (!road) return;
-  road.points.forEach((point, pointIndex) => {
+  const start = tablePage(body, road.points.length, "road:" + selectedRoadIndex(), renderRoadPoints);
+  road.points.slice(start, start + 100).forEach((point, localIndex) => {
+    const pointIndex = start + localIndex;
     const roadName = road.name || `road ${selectedRoadIndex() + 1}`;
     const row = document.createElement("tr");
     row.innerHTML = `<td><button id="road-point-${pointIndex}-insert" type="button" class="insert" aria-label="Insert (+) road point before point ${pointIndex + 1}">+</button><button id="road-point-${pointIndex}-remove" type="button" class="remove" aria-label="Remove (−) road point ${pointIndex + 1}">−</button></td><td><input id="road-point-${pointIndex}-x" type="number" step="any" value="${point[0]}"></td><td><input id="road-point-${pointIndex}-y" type="number" step="any" value="${point[1]}"></td>`;
@@ -192,9 +194,10 @@ function renderRoadPoints() {
     row.querySelectorAll("input").forEach((input) => input.onchange = (event) => {
       // A number input reports invalid or cleared content as "", which Number()
       // would turn into 0 and quietly warp the reference line.
-      const points = [...body.rows].map((candidate) => [...candidate.querySelectorAll("input")].map((entry) => (
-        entry.value.trim() === "" ? NaN : Number(entry.value)
-      )));
+      const points = road.points.map((point) => [...point]);
+      [...body.rows].forEach((candidate, localIndex) => {
+        points[start + localIndex] = [...candidate.querySelectorAll("input")].map((entry) => entry.value.trim() === "" ? NaN : Number(entry.value));
+      });
       if (points.flat().some((coordinate) => !Number.isFinite(coordinate))) {
         markFieldInvalid(event.currentTarget, "Road point coordinates must be numeric");
         return;

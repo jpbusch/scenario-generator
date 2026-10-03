@@ -6,6 +6,39 @@ repository. The project itself is licensed under the terms in `LICENSE`.
 
 ## Runtime dependencies
 
+### Lanelet2
+
+- Declared version: `1.2.3` (Linux x86_64)
+- License: BSD 3-Clause License (`BSD-3-Clause`)
+- Source and license: https://github.com/fzi-forschungszentrum-informatik/Lanelet2
+
+### NumPy
+
+- Declared version: `>=1.24`
+- License: BSD 3-Clause License (`BSD-3-Clause`)
+- Source and bundled notices: https://github.com/numpy/numpy
+
+### pyproj
+
+- Declared version: `>=3.6`
+- License: MIT License
+- Source and license: https://github.com/pyproj4/pyproj
+
+### Rasterio
+
+- Declared version: `>=1.4`
+- License: BSD 3-Clause License (`BSD-3-Clause`)
+- Source and bundled GDAL notices: https://github.com/rasterio/rasterio
+
+### NRW digital orthophotos
+
+- Provider: Geobasis NRW, Land NRW
+- Service: https://www.wms.nrw.de/geobasis/wms_nw_dop (layer `nw_dop_rgb`)
+- Service metadata checked on 2026-10-02: Datenlizenz Deutschland – Zero 2.0
+  (https://www.govdata.de/dl-de/zero-2-0).
+- The service's current access conditions are published in its WMS GetCapabilities.
+  The application displays the provider attribution with its orthophoto controls.
+
 ### defusedxml
 
 - Declared version: `>=0.7.1`

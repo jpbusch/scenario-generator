@@ -72,6 +72,72 @@ Scenarios can be exported in different formats for further usage:
 
 ## Development setup
 
+### Run locally with Docker Compose
+
+From the repository root:
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+Open [http://localhost:8000](http://localhost:8000). Compose builds the existing
+Dockerfile from your checkout; `SCENARIO_GENERATOR_IMAGE` still controls the
+image name. The `orthophoto-cache` named volume retains downloaded NRW imagery
+across container restarts. Save the scenario configuration/export bundle before
+restarting: editor sessions themselves remain temporary, as in the original app.
+
+### Georeferenced maps and automatic vehicle routes
+
+1. Load an OpenDRIVE map as usual. Its `geoReference` and header offset establish
+   the local working frame. For this checkout, try `example_maps/campus.xodr`.
+2. Open **Geographic layers** and import a Lanelet2 `.osm` map, for example
+   `example_maps/aachen.osm`. It is projected into the XODR frame; importing it
+   does not replace the XODR. Lanelet2 alone establishes a nearby local UTM frame.
+3. Toggle **NRW orthophotos**, Lanelet2 and coordinate origins independently.
+   Use the opacity sliders to compare the maps. Orthophotos load online only
+   near the map extent and visible viewport; failures leave the editor usable.
+4. Select a vehicle and open **Create vehicle route**. Choose XODR or Lanelet2,
+   pick a start and target on the canvas, and optionally add via points. Numeric
+   entries accept local X/Y or longitude/latitude, one point per line. An optional
+   third value selects a lane: `road_id:section_index:lane_id` for imported XODR,
+   `road_name:lane_id` for synthetic maps, or a Lanelet2 ID. An inverted Lanelet2
+   direction uses its negative ID when vehicle traffic rules permit it.
+5. Enter start/end/reference speeds in km/h, positive acceleration and braking
+   in m/s², a start time and sampling interval. **Preview route** displays its
+   direction, matched lanes, length, duration and lane changes. **Use route**
+   replaces only the selected actor's trajectory.
+6. Edit the generated points and speeds with the existing tools. Large tables
+   have pages of 100 rows; the canvas thins sample labels for readability.
+   Generated routes use kinematic interpolation so their constant acceleration
+   profile is retained. Manual trajectories keep their established smoothing.
+
+Routing observes lane direction, vehicle accessibility, topology and lane-change
+permissions. Lane changes need a continuous driving corridor and at least 15 m
+of usable parallel lane length. The speed profile follows the explicitly entered
+reference speed; it does not simulate traffic lights, interactions or speed-limit
+compliance. Short routes reduce the reachable peak speed; impossible endpoint
+speeds produce an error. Editing does not regenerate a route automatically.
+
+For an XODR without a geographic reference, enter a projected metric CRS, origin
+and rotation under **Set map georeference** before using geographic overlays.
+The origin is the projected coordinate of local `(0, 0)`; rotation is in radians.
+Lanelet2's displayed projection origin is a working reference near its first
+node, not an origin assumed to be stored in the OSM file.
+
+Project configuration version 5 saves the working frame, layer settings and
+generation/interpolation metadata. Older configurations still load. Export
+bundles include the referenced `.xodr` and `.osm` dependencies. To reload an
+extracted bundle, upload its map files first, then its configuration. Missing
+map references are reported and can be supplied separately. Imagery stays in
+the cache rather than the export bundle.
+
+Lanelet2's packaged Python bindings currently target Linux x86_64, matching the
+local Docker setup; ROS is not required. The NRW service and source are
+[documented by map.nrw](https://map.nrw/dokumentation/latest/). Implementation
+status, checks and performance measurements are tracked in [TASKS.md](TASKS.md).
+
+### Develop in VS Code
+
 This repository has one supported local development environment: its
 [VS Code Dev Container](https://code.visualstudio.com/docs/devcontainers/containers).
 The host only needs:

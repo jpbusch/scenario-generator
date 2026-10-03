@@ -8,6 +8,7 @@ from copy import deepcopy
 from contextvars import ContextVar
 from html import escape
 import math
+import json
 import itertools
 import importlib.util
 from importlib.resources import files
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 
@@ -59,6 +60,14 @@ from scenario_generator.scenario_elements.road_user.road_user import (
     safe_vehicle_name,
 )
 from scenario_generator.scenario_elements.road_user.trajectory import Trajectory, Waypoint
+
+from scenario_generator.webapp.geodata import GeoWorkspace
+from scenario_generator.map.georeference import MapFrame, read_xodr_frame
+from scenario_generator.map.orthophoto import OrthophotoCache
+from scenario_generator.map.georeference import write_referenced_xodr
+
+compact_snapshot = ContextVar("compact_snapshot", default=False)
+orthophoto_cache = OrthophotoCache()
 
 WEBAPP_RESOURCES = files("scenario_generator.webapp")
 PACKAGE_RESOURCES = files("scenario_generator")
@@ -244,6 +253,9 @@ class WebScenario:
         self.dimensions: dict[str, VehicleDimensions] = {}
         self.carla_blueprints = load_carla_blueprint_catalog()
         self.map = ScenarioMap()
+        self.geo = GeoWorkspace()
+        self._map_cache = None
+        self._actor_cache = {}
         self.detection_gaps: list[DetectionGap] = []
         self.additional_information: dict[str, object] = {}
         self.map_load_hint: str | None = None
@@ -268,6 +280,11 @@ class WebScenario:
             "show_min_ttc": False,
             "show_min_thw": False,
             "show_map": True,
+            "show_lanelet": True,
+            "show_origins": False,
+            "show_orthophoto": False,
+            "orthophoto_opacity": 1.0,
+            "map_opacity": 0.65,
             "show_road_connections": False,
             "show_road_points": False,
             "show_lane_numbers": False,
@@ -669,7 +686,7 @@ class WebScenario:
             return
         waypoints.sort(key=lambda point: point.time_s)
         Trajectory.validate_explicit_speeds(waypoints)
-        trajectory = Trajectory(waypoints=waypoints)
+        trajectory = self.actor_trajectory(name, waypoints)
         if self.settings["trajectory_calculation_mode"] == "backward":
             segment_index = min(changed_index, len(waypoints) - 2)
             for index in range(segment_index, -1, -1):
@@ -712,7 +729,7 @@ class WebScenario:
             if waypoints:
                 waypoints[0].speed_mps = 0.0
             return
-        trajectory = Trajectory(waypoints=waypoints)
+        trajectory = self.actor_trajectory(name, waypoints)
         trajectory.synchronize_times_from_speeds(max(0.0, waypoints[0].time_s))
 
     def set_waypoint_speed(self, name: str, point_index: int, speed_mps: float) -> None:
@@ -780,8 +797,8 @@ class WebScenario:
                 for point in waypoints:
                     point.time_s += correction
 
-            Trajectory(waypoints=waypoints).validate_moving_waypoints(waypoints)
-            trajectory = Trajectory(waypoints=waypoints)
+            self.actor_trajectory(name, waypoints).validate_moving_waypoints(waypoints)
+            trajectory = self.actor_trajectory(name, waypoints)
             if self.settings["trajectory_calculation_mode"] == "backward":
                 target_segment = min(point_index, len(waypoints) - 2)
                 for index in range(target_segment, -1, -1):
@@ -814,7 +831,7 @@ class WebScenario:
                             waypoints[index + 1].time_s = waypoints[index].time_s + 2.0 * seg_dist / speed_sum
                     else:
                         waypoints[index + 1].speed_mps = speed
-            Trajectory(waypoints=waypoints).validate_moving_waypoints(waypoints)
+            self.actor_trajectory(name, waypoints).validate_moving_waypoints(waypoints)
         except (IndexError, TypeError, ValueError):
             self.restore_waypoints(name, snapshot)
             raise
@@ -920,8 +937,9 @@ class WebScenario:
                     waypoints=waypoints, parked_yaw_rad=dimensions.parked_yaw_rad
                 ).as_parked_series()
                 if len(waypoints) == 1
-                else Trajectory(waypoints=waypoints).as_moving_series()
+                else self.actor_trajectory(name, waypoints).as_moving_series()
             )
+            trajectory["interpolation_mode"] = self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth")
             trajectory["actor_type"] = dimensions.actor_type
             trajectory["detected"] = [
                 not any(gap.vehicle_name == name and gap.contains(time_s) for gap in self.detection_gaps)
@@ -1071,36 +1089,15 @@ class WebScenario:
             runs.append((lane_type, active_profiles))
         return runs
 
-    def actor_snapshot(self, name: str, waypoints: list[Waypoint]) -> dict[str, object]:
-        """Serialize one actor with the exact curve used by desktop playback."""
-        dimensions = self.dimensions[name]
-        trajectory = Trajectory(
-            waypoints=waypoints, parked_yaw_rad=dimensions.parked_yaw_rad
-        )
-        curve = trajectory.as_series() if waypoints else {}
-        return {
-            "name": name,
-            "waypoints": [point.__dict__ for point in waypoints],
-            "segment_speeds_mps": trajectory.segment_average_speeds()
-            if len(waypoints) > 1
-            else [],
-            "profile_distances_m": trajectory.cumulative_waypoint_distances(),
-            "segment_midpoints": [
-                trajectory.curve_point_for_segment(index, 0.5)
-                for index in range(len(waypoints) - 1)
-            ],
-            "curve": curve,
-            "dimensions": dimensions.as_dict(),
-        }
+    def actor_trajectory(self, name, waypoints):
+        return Trajectory(waypoints=waypoints, parked_yaw_rad=self.dimensions.get(name, VehicleDimensions()).parked_yaw_rad,
+                          interpolation_mode=self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth"))
 
-    def snapshot(self) -> dict[str, object]:
-        """Serialize the complete current scenario state for the browser client."""
-        return {
-            "actors": [
-                self.actor_snapshot(name, waypoints)
-                for name, waypoints in self.vehicles.items()
-            ],
-            "map": {
+    def map_snapshot(self):
+        key = (self.geo.revision, id(self.map.roads), id(self.map.view_roads), self.map.edit_enabled)
+        if self._map_cache and self._map_cache[0] == key:
+            return self._map_cache[1]
+        result = {
                 "path": str(self.map.path) if self.map.path else "",
                 "edit_enabled": self.map.edit_enabled,
                 "roads": [
@@ -1122,7 +1119,51 @@ class WebScenario:
                     }
                     for road in self.map.display_roads
                 ],
-            },
+            }
+        result["revision"] = self.geo.revision
+        points = [point for road in result["roads"] for point in road["points"]]
+        result["bounds"] = [min(p[0] for p in points), min(p[1] for p in points),
+                            max(p[0] for p in points), max(p[1] for p in points)] if points else None
+        self._map_cache = (key, result)
+        return result
+
+    def actor_snapshot(self, name: str, waypoints: list[Waypoint]) -> dict[str, object]:
+        """Serialize one actor with the exact curve used by desktop playback."""
+        dimensions = self.dimensions[name]
+        signature = (tuple((p.time_s, p.x_m, p.y_m, p.speed_mps) for p in waypoints),
+                     tuple(dimensions.as_dict().items()), dimensions.parked_yaw_rad,
+                     self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth"))
+        cached = self._actor_cache.get(name)
+        if cached and cached[0] == signature:
+            return cached[1]
+        trajectory = self.actor_trajectory(name, waypoints)
+        curve = trajectory.as_series() if waypoints else {}
+        result = {
+            "name": name,
+            "waypoints": [dict(point.__dict__) for point in waypoints],
+            "segment_speeds_mps": trajectory.segment_average_speeds()
+            if len(waypoints) > 1
+            else [],
+            "profile_distances_m": trajectory.cumulative_waypoint_distances(),
+            "segment_midpoints": trajectory.segment_midpoints(),
+            "curve": curve,
+            "dimensions": dimensions.as_dict(),
+            "trajectory_options": self.geo.actor_options.get(name, {}),
+        }
+        self._actor_cache[name] = (signature, result)
+        return result
+
+    def snapshot(self) -> dict[str, object]:
+        """Serialize the current state, optionally leaving cached layers separate."""
+        self.geo.sync_map(self)
+        return {
+            "actors": [
+                self.actor_snapshot(name, waypoints)
+                for name, waypoints in self.vehicles.items()
+            ],
+            "map": {"revision": self.geo.revision, "path": str(self.map.path or ""),
+                    "edit_enabled": self.map.edit_enabled} if compact_snapshot.get() else self.map_snapshot(),
+            "geodata": self.geo.payload(),
             "additional_information": self.additional_information,
             "map_load_hint": self.map_load_hint,
             "detection_gaps": [gap.__dict__ for gap in self.detection_gaps],
@@ -1378,6 +1419,7 @@ def confined_session_map_path(map_path: Path) -> Path:
 
 def load_validated_map(map_path: Path) -> list[MapPolyline]:
     """Parse and validate one map before exposing it to the session."""
+    read_xodr_frame(map_path)
     roads = load_xodr_reference_map(map_path)
     validate_imported_map(roads)
     return roads
@@ -1512,6 +1554,11 @@ def remove_quality_checker_temporary_copy(input_path: Path):
         processed_path.unlink(missing_ok=True)
 
 
+@asynccontextmanager
+async def unlocked_session():
+    yield
+
+
 @app.middleware("http")
 async def bind_scenario_session(request: Request, call_next: Any) -> Any:
     """Bind each request to a cookie-scoped scenario and serialize its access."""
@@ -1522,15 +1569,17 @@ async def bind_scenario_session(request: Request, call_next: Any) -> Any:
         session_id = uuid4().hex
     assert session_id is not None
     session = scenario_store.get(session_id)
-    async with session.lock:
+    async with session.lock if not request.url.path.startswith("/api/orthophoto/") else unlocked_session():
         scenario_token = active_scenario.set(session.scenario)
         session_token = active_session_id.set(session_id)
+        compact_token = compact_snapshot.set(request.query_params.get("compact") == "true")
         try:
             response = await call_next(request)
         finally:
             scenario_store.touch(session_id)
             active_session_id.reset(session_token)
             active_scenario.reset(scenario_token)
+            compact_snapshot.reset(compact_token)
     if new_session:
         response.set_cookie(
             SESSION_COOKIE_NAME,
@@ -1568,6 +1617,13 @@ def apply_imported_scenario(
 ) -> None:
     """Replace browser state with data returned by an existing importer."""
     validate_imported_scenario(vehicles, dimensions)
+    revision = scenario.geo.revision
+    lanelet_sources = scenario.geo.lanelet_sources
+    scenario.geo = GeoWorkspace()
+    scenario.geo.lanelet_sources = lanelet_sources
+    scenario.geo.revision = revision + 1
+    scenario._map_cache = None
+    scenario._actor_cache.clear()
     scenario.vehicles = vehicles
     scenario.dimensions = dimensions
     scenario.detection_gaps = detection_gaps or []
@@ -1948,6 +2004,11 @@ def update_actor(name: str, payload: dict[str, Any]) -> dict[str, object]:
     ):
         if key in payload:
             setattr(dimensions, key, str(payload[key]))
+    if "interpolation_mode" in payload:
+        mode = payload["interpolation_mode"]
+        if mode not in {"smooth", "kinematic"}:
+            raise HTTPException(status_code=400, detail="Unknown trajectory interpolation mode")
+        scenario.geo.actor_options.setdefault(name, {})["interpolation_mode"] = mode
     if "waypoints" in payload:
         scenario.replace_waypoints(name, payload["waypoints"])
         snap_index = payload.get("snap_waypoint_index")
@@ -2087,6 +2148,11 @@ def update_settings(payload: dict[str, Any]) -> dict[str, object]:
             raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
         if key == "time_step_s":
             scenario.settings[key] = max(float(value), 0.001)
+        elif key in {"orthophoto_opacity", "map_opacity"}:
+            value = float(value)
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise HTTPException(status_code=400, detail="Opacity must be between 0 and 1")
+            scenario.settings[key] = value
         elif key in {"waypoint_timing_mode", "trajectory_calculation_mode"}:
             scenario.settings[key] = str(value)
         else:
@@ -2148,6 +2214,9 @@ def delete_actor(name: str) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="At least one actor is required")
     scenario.vehicles.pop(name, None)
     scenario.dimensions.pop(name, None)
+    scenario.geo.actor_options.pop(name, None)
+    scenario.geo.previews.pop(name, None)
+    scenario._actor_cache.pop(name, None)
     scenario.detection_gaps = [
         gap for gap in scenario.detection_gaps if gap.vehicle_name != name
     ]
@@ -2169,6 +2238,10 @@ def rename_actor(name: str, payload: dict[str, Any]) -> dict[str, object]:
         return {"name": name, "scenario": scenario.snapshot()}
     scenario.vehicles[new_name] = scenario.vehicles.pop(name)
     scenario.dimensions[new_name] = scenario.dimensions.pop(name)
+    if name in scenario.geo.actor_options:
+        scenario.geo.actor_options[new_name] = scenario.geo.actor_options.pop(name)
+    scenario.geo.previews.pop(name, None)
+    scenario._actor_cache.pop(name, None)
     for gap in scenario.detection_gaps:
         if gap.vehicle_name == name:
             gap.vehicle_name = new_name
@@ -2192,6 +2265,7 @@ async def upload_map(file: UploadFile = File(...)) -> dict[str, object]:
         upload_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Invalid OpenDRIVE file: {exc}") from exc
     scenario.map.load_view_only(roads, upload_path)
+    scenario.geo.map_path = None
     scenario.map_load_hint = None
     return scenario.snapshot()
 
@@ -2246,6 +2320,7 @@ def clear_map_road_connections(index: int) -> dict[str, object]:
             other.predecessor_road = ""
             other.predecessor_lane_links = ""
     scenario.map.modified = True
+    scenario.map.invalidate_elevation_index()
     return scenario.snapshot()
 
 
@@ -2285,6 +2360,7 @@ def connect_map_roads(payload: dict[str, Any]) -> dict[str, object]:
     source.successor_lane_links = f"{source_lane_id}->{target_lane_id}"
     target.predecessor_lane_links = f"{target_lane_id}->{source_lane_id}"
     scenario.map.modified = True
+    scenario.map.invalidate_elevation_index()
     return scenario.snapshot()
 
 
@@ -2313,6 +2389,7 @@ def add_map_road(payload: dict[str, Any]) -> dict[str, object]:
         ),
     )
     scenario.map.modified = True
+    scenario.map.invalidate_elevation_index()
     return scenario.snapshot()
 
 
@@ -2470,7 +2547,7 @@ def export_map(payload: dict[str, Any]) -> FileResponse:
     export_directory.mkdir(parents=True, exist_ok=True)
     output_path = export_directory / f"{safe_output_name(str(payload.get('base_name', 'map')))}.xodr"
     try:
-        write_xodr_map(output_path, scenario.map.roads)
+        write_xodr_map(output_path, scenario.map.roads, frame=scenario.geo.frame)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FileResponse(output_path, filename=output_path.name)
@@ -2485,12 +2562,15 @@ def write_current_map_export(output_path: Path) -> None:
         and not scenario.map.modified
     ):
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, output_path)
+        if scenario.geo.frame and scenario.geo.frame != read_xodr_frame(source_path):
+            write_referenced_xodr(source_path, output_path, scenario.geo.frame)
+        else:
+            shutil.copyfile(source_path, output_path)
         return
     roads = scenario.map.roads if scenario.map.edit_enabled else scenario.map.view_roads
     if not roads:
         raise ValueError("An XODR export requires a loaded or created map.")
-    write_xodr_map(output_path, roads)
+    write_xodr_map(output_path, roads, frame=scenario.geo.frame)
 
 
 @app.post("/api/import")
@@ -2588,6 +2668,31 @@ async def import_config(file: UploadFile = File(...)) -> dict[str, object]:
                     imported_vehicles = load_trajectory_json(upload_path)
                     imported_dimensions = load_trajectory_json_dimensions(upload_path)
 
+        pending_workspace = None
+        if suffix == ".json" and imported_vehicles is not None:
+            config = json.loads(upload_path.read_text())
+            if isinstance(config, dict) and config.get("workspace"):
+                candidate = WebScenario()
+                candidate.vehicles = imported_vehicles
+                candidate.dimensions = imported_dimensions
+                candidate.settings = dict(scenario.settings)
+                if imported_roads is not None:
+                    candidate.map.load_view_only(imported_roads, imported_map_path)
+                candidate.geo.revision = scenario.geo.revision + 1
+                candidate.geo.lanelet_sources = dict(scenario.geo.lanelet_sources)
+                candidate.geo.restore(config["workspace"], candidate, upload_path.parent)
+                pending_workspace = candidate
+            elif isinstance(config, dict) and "vehicles" not in config:
+                candidate = WebScenario()
+                candidate.geo.revision = scenario.geo.revision + 1
+                for actor_name, entry in config.items():
+                    if actor_name in imported_vehicles and isinstance(entry, dict):
+                        mode = entry.get("interpolation_mode", "smooth")
+                        if mode not in {"smooth", "kinematic"}:
+                            raise ValueError("Unknown trajectory interpolation mode.")
+                        candidate.geo.actor_options[actor_name] = {"interpolation_mode": mode}
+                pending_workspace = candidate
+
         if imported_vehicles is not None:
             apply_imported_scenario(
                 imported_vehicles, imported_dimensions, imported_gaps
@@ -2606,6 +2711,12 @@ async def import_config(file: UploadFile = File(...)) -> dict[str, object]:
     except IMPORT_DATA_ERRORS as exc:
         upload_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if pending_workspace is not None:
+        scenario.geo = pending_workspace.geo
+        if config.get("workspace"):
+            scenario.settings.update(pending_workspace.settings)
+            scenario.geo.map_revision = scenario.map.revision
+            scenario.geo.map_path = scenario.map.path
     return scenario.snapshot()
 
 
@@ -2643,13 +2754,14 @@ def export_scenario(format_name: str, payload: dict[str, Any]) -> FileResponse:
                 scenario.map.path,
                 scenario.detection_gaps,
                 additional_information,
+                workspace=scenario.geo.persisted(scenario),
             )
         elif format_name == "mcap":
             output_path = export_directory / f"{base_name}.mcap"
             map_path = scenario.map.path
-            if scenario.map.edit_enabled and scenario.map.modified:
+            if scenario.map.modified:
                 map_path = export_directory / f"{base_name}.xodr"
-                write_xodr_map(map_path, scenario.map.roads)
+                write_current_map_export(map_path)
             exporter = exporter_registry.exporter_for(output_path)
             if exporter is None:
                 raise ValueError("Omega-Prime exporter is unavailable")
@@ -2748,6 +2860,10 @@ def export_scenario_bundle(payload: dict[str, Any]) -> FileResponse:
                 )
                 written_paths.append(mcap_path)
 
+            lanelet_path = None
+            if scenario.geo.lanelet:
+                lanelet_path = output_directory / f"{base_name}.osm"
+                shutil.copyfile(scenario.geo.lanelet.path, lanelet_path)
             config_path = output_directory / f"{base_name}_config.json"
             write_scenario_config(
                 config_path,
@@ -2756,6 +2872,7 @@ def export_scenario_bundle(payload: dict[str, Any]) -> FileResponse:
                 map_path,
                 scenario.detection_gaps,
                 exported_additional_information,
+                workspace=scenario.geo.persisted(scenario, lanelet_path.name if lanelet_path else None),
             )
             written_paths.append(config_path)
 
@@ -2859,6 +2976,103 @@ def quality_check_pdf(payload: dict[str, Any]) -> FileResponse:
     except Exception as exc:  # noqa: BLE001 - checker errors reach the browser.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FileResponse(pdf_path, filename=pdf_path.name)
+
+
+@app.get("/api/layers")
+def get_layers(revision: int | None = None):
+    scenario.geo.sync_map(scenario.current())
+    if revision is not None and revision != scenario.geo.revision:
+        raise HTTPException(status_code=409, detail="Map changed; reload the current layers.")
+    return {"map": scenario.map_snapshot(),
+            "lanelet": scenario.geo.lanelet.geometry if scenario.geo.lanelet and scenario.geo.frame else [],
+            "geodata": scenario.geo.payload()}
+
+
+@app.post("/api/lanelet")
+async def upload_lanelet(file: UploadFile = File(...)):
+    if Path(file.filename or "").suffix.lower() != ".osm":
+        raise HTTPException(status_code=400, detail="Choose a Lanelet2 .osm file.")
+    path = session_export_directory() / "imports" / f"{uuid4().hex}_{safe_upload_name(file.filename, 'map.osm')}"
+    await store_upload(file, path, MAX_STRUCTURED_UPLOAD_BYTES)
+    try:
+        scenario.geo.sync_map(scenario.current())
+        await asyncio.to_thread(scenario.geo.add_lanelet, path, scenario.current())
+        scenario.geo.lanelet_sources[safe_upload_name(file.filename, "map.osm")] = path
+    except IMPORT_DATA_ERRORS as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return scenario.snapshot()
+
+
+@app.delete("/api/lanelet")
+def remove_lanelet():
+    scenario.geo.lanelet = None
+    scenario.geo.invalidate()
+    return scenario.snapshot()
+
+
+@app.patch("/api/georeference")
+def set_georeference(payload: dict[str, Any]):
+    try:
+        frame = MapFrame.from_payload(payload)
+        scenario.geo.set_frame(frame, scenario.current(), transform_map=True)
+        scenario.geo.map_path = scenario.map.path
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return scenario.snapshot()
+
+
+@app.get("/api/orthophoto/{revision}/{level}/{column}/{row}")
+async def orthophoto_tile(revision: int, level: int, column: int, row: int):
+    frame = scenario.geo.frame
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Orthophotos require a map georeference.")
+    if revision != scenario.geo.revision:
+        raise HTTPException(status_code=409, detail="Map frame changed.")
+    try:
+        image = await asyncio.to_thread(orthophoto_cache.tile, frame, level, column, row)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"NRW orthophoto unavailable: {exc}") from exc
+    # Session revision numbers may repeat after a restart; the persistent cache
+    # uses the complete frame, whereas a browser URL cache could serve old tiles.
+    return Response(image, media_type="image/png", headers={"Cache-Control": "private, no-store"})
+
+
+@app.post("/api/actors/{name}/route/preview")
+def preview_actor_route(name: str, payload: dict[str, Any]):
+    if name not in scenario.vehicles:
+        raise HTTPException(status_code=404, detail="Actor not found")
+    try:
+        scenario.geo.sync_map(scenario.current())
+        return scenario.geo.preview(scenario.current(), name, payload)
+    except IMPORT_DATA_ERRORS as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/actors/{name}/route/apply")
+def apply_actor_route(name: str, payload: dict[str, Any]):
+    if name not in scenario.vehicles:
+        raise HTTPException(status_code=404, detail="Actor not found")
+    preview = scenario.geo.previews.get(name)
+    if not preview:
+        raise HTTPException(status_code=409, detail="Create a new route preview first.")
+    result, waypoints, parameters = preview
+    if payload.get("preview_id") != result["preview_id"]:
+        raise HTTPException(status_code=409, detail="Route preview changed; use the latest preview.")
+    if (payload.get("map_revision") != scenario.geo.revision or
+            result["map_revision"] != scenario.geo.revision or
+            payload.get("actor_revision") != scenario.geo.actor_revision(scenario.current(), name)):
+        raise HTTPException(status_code=409, detail="Map or actor changed; create a new preview.")
+    if result["actor_revision"] != payload.get("actor_revision"):
+        raise HTTPException(status_code=409, detail="Actor changed; create a new preview.")
+    try:
+        validate_imported_scenario({**scenario.vehicles, name: waypoints}, scenario.dimensions)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scenario.vehicles[name] = waypoints
+    scenario.geo.actor_options[name] = {"interpolation_mode": "kinematic", "generation": parameters}
+    scenario.geo.previews.pop(name)
+    return scenario.snapshot()
 
 
 def main():

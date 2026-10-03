@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import itertools
+from bisect import bisect_left
+from functools import wraps
 import math
 from dataclasses import dataclass, field
 
@@ -13,6 +15,20 @@ from scenario_generator.geometry_utils import (
     normalize_angle_rad,
     smoothstep,
 )
+
+
+def evaluated(method):
+    """Sort mutable control points once per evaluation, never cache across edits."""
+    @wraps(method)
+    def evaluate(self, *args, **kwargs):
+        previous = self._ordered_waypoints
+        if previous is None:
+            self._ordered_waypoints = sorted(self.waypoints, key=lambda point: point.time_s)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._ordered_waypoints = previous
+    return evaluate
 
 
 @dataclass
@@ -30,11 +46,14 @@ class Trajectory:
     waypoints: list[Waypoint] = field(default_factory=list)
     detected: list[bool] | None = None
     parked_yaw_rad: float = 0.0
+    interpolation_mode: str = "smooth"
+    _ordered_waypoints: list[Waypoint] | None = field(default=None, init=False, repr=False)
 
     PROFILE_DISTANCE_SAMPLES_PER_SEGMENT = load_profile_distance_samples_per_segment()
     MIN_DISTANCE_M = 1e-9
     MIN_SPEED_SUM_MPS = 1e-9
 
+    @evaluated
     def as_series(self) -> dict[str, list[float] | list[bool]]:
         if len(self.waypoints) == 1:
             trajectory = self.as_parked_series()
@@ -45,7 +64,7 @@ class Trajectory:
         return trajectory
 
     def sorted_waypoints(self) -> list[Waypoint]:
-        return sorted(self.waypoints, key=lambda waypoint: waypoint.time_s)
+        return self._ordered_waypoints if self._ordered_waypoints is not None else sorted(self.waypoints, key=lambda waypoint: waypoint.time_s)
 
     def validate_moving_waypoints(self, waypoints: list[Waypoint]) -> None:
         if len(waypoints) < 2:
@@ -53,6 +72,10 @@ class Trajectory:
         for previous, current in itertools.pairwise(waypoints):
             if current.time_s <= previous.time_s:
                 raise ValueError("Waypoint times must be unique and increasing.")
+
+    @evaluated
+    def segment_midpoints(self):
+        return [self.curve_point_for_segment(i, 0.5) for i in range(len(self.waypoints) - 1)]
 
     def curve_point_for_segment(
         self,
@@ -65,6 +88,9 @@ class Trajectory:
         p1 = waypoints[segment_index]
         p2 = waypoints[segment_index + 1]
         p3 = waypoints[min(segment_index + 2, last_index)]
+        if self.interpolation_mode == "kinematic":
+            return (p1.x_m + fraction * (p2.x_m - p1.x_m),
+                    p1.y_m + fraction * (p2.y_m - p1.y_m))
         return catmull_rom(
             (p0.x_m, p0.y_m),
             (p1.x_m, p1.y_m),
@@ -83,6 +109,7 @@ class Trajectory:
             math.ceil(duration / CURVE_SAMPLE_PERIOD_S),
         )
 
+    @evaluated
     def sampled_curve_points_for_segment(
         self,
         segment_index: int,
@@ -96,6 +123,7 @@ class Trajectory:
             segment_index, sample_count, include_end
         )
 
+    @evaluated
     def sampled_curve_points_for_segment_count(
         self,
         segment_index: int,
@@ -111,11 +139,17 @@ class Trajectory:
         points: list[tuple[float, float, float]] = []
         for sample_index in range(stop):
             fraction = sample_index / sample_count
-            x_m, y_m = self.curve_point_for_segment(segment_index, fraction)
+            progress = fraction
+            if self.interpolation_mode == "kinematic":
+                v0, v1 = float(start.speed_mps or 0), float(end.speed_mps or 0)
+                if v0 + v1 > self.MIN_SPEED_SUM_MPS:
+                    progress = (2 * v0 * fraction + (v1 - v0) * fraction**2) / (v0 + v1)
+            x_m, y_m = self.curve_point_for_segment(segment_index, progress)
             time_s = start.time_s + (end.time_s - start.time_s) * fraction
             points.append((time_s, x_m, y_m))
         return points
 
+    @evaluated
     def sampled_curve_points(self) -> list[tuple[float, float, float]]:
         waypoints = self.sorted_waypoints()
         points: list[tuple[float, float, float]] = []
@@ -128,12 +162,17 @@ class Trajectory:
             )
         return points
 
+    @evaluated
     def segment_curve_distance(self, segment_index: int) -> float:
         points = self.sampled_curve_points_for_segment(segment_index)
         return self.curve_distance_from_points(points)
 
+    @evaluated
     def profile_segment_curve_distance(self, segment_index: int) -> float:
         """Return a stable geometric length used to derive profile timestamps."""
+        if self.interpolation_mode == "kinematic":
+            start, end = self.sorted_waypoints()[segment_index:segment_index + 2]
+            return math.hypot(end.x_m - start.x_m, end.y_m - start.y_m)
         points = self.sampled_curve_points_for_segment_count(
             segment_index,
             self.PROFILE_DISTANCE_SAMPLES_PER_SEGMENT,
@@ -149,6 +188,7 @@ class Trajectory:
             distance += math.hypot(current[1] - previous[1], current[2] - previous[2])
         return distance
 
+    @evaluated
     def cumulative_waypoint_distances(self) -> list[float]:
         """Return cumulative geometric distances at the sorted support points."""
         waypoints = self.sorted_waypoints()
@@ -161,6 +201,7 @@ class Trajectory:
             )
         return distances
 
+    @evaluated
     def segment_average_speeds(self) -> list[float]:
         waypoints = self.sorted_waypoints()
         averages: list[float] = []
@@ -235,6 +276,7 @@ class Trajectory:
             return 0.0
         return max(0.0, float(waypoints[0].speed_mps))
 
+    @evaluated
     def resolved_waypoint_speeds(self) -> tuple[list[float], bool]:
         """Return explicit support speeds or derive them for legacy input."""
         waypoints = self.sorted_waypoints()
@@ -252,6 +294,7 @@ class Trajectory:
             self.initial_speed_mps(),
         )
 
+    @evaluated
     def synchronize_times_from_speeds(self, start_time_s: float = 0.0) -> None:
         """Derive times so every segment matches its endpoint-speed average."""
         waypoints = self.sorted_waypoints()
@@ -296,9 +339,15 @@ class Trajectory:
     def smooth_speed_at_fraction(start_speed: float, end_speed: float, fraction: float) -> float:
         return start_speed + (end_speed - start_speed) * smoothstep(fraction)
 
+    @evaluated
     def as_moving_series(self) -> dict[str, list[float] | list[bool]]:
         waypoints = self.sorted_waypoints()
         self.validate_moving_waypoints(waypoints)
+        if self.interpolation_mode == "kinematic":
+            xs, ys = [p.x_m for p in waypoints], [p.y_m for p in waypoints]
+            return {"time_s": [p.time_s for p in waypoints], "x_m": xs, "y_m": ys,
+                    "speed_mps": [float(p.speed_mps or 0) for p in waypoints],
+                    "yaw_rad": [heading_between(xs, ys, i, self.parked_yaw_rad) for i in range(len(xs))]}
         waypoint_speeds, _adjusted = self.resolved_waypoint_speeds()
         sampled_points: list[tuple[float, float, float]] = []
         speed_values: list[float] = []
@@ -314,7 +363,9 @@ class Trajectory:
                 fraction = 0.0 if duration <= 0.0 else (time_s - start_time) / duration
                 sampled_points.append((time_s, x_m, y_m))
                 speed_values.append(
-                    self.smooth_speed_at_fraction(
+                    (waypoint_speeds[segment_index] + fraction *
+                     (waypoint_speeds[segment_index + 1] - waypoint_speeds[segment_index]))
+                    if self.interpolation_mode == "kinematic" else self.smooth_speed_at_fraction(
                         waypoint_speeds[segment_index],
                         waypoint_speeds[segment_index + 1],
                         fraction,
@@ -339,6 +390,7 @@ class Trajectory:
             trajectory["detected"] = self.detected
         return trajectory
 
+    @evaluated
     def as_parked_series(self) -> dict[str, list[float]]:
         if not self.waypoints:
             raise ValueError("A parked vehicle needs at least one waypoint.")
@@ -362,36 +414,36 @@ class Trajectory:
                 return math.atan2(dy, dx)
         return fallback_yaw_rad
 
+    @evaluated
     def interpolate(self, interpol_time: float) -> tuple[float, float, float]:
         if not self.waypoints:
             raise ValueError("Trajectory is empty.")
         if len(self.waypoints) == 1:
             parked = self.as_parked_series()
             return parked["x_m"][0], parked["y_m"][0], parked["yaw_rad"][0]
-        return interpolate_trajectory(self.as_moving_series(), interpol_time)
+        return interpolate_trajectory(self.as_moving_series(), interpol_time, self.interpolation_mode)
 
 
-def interpolate_trajectory(trajectory: dict[str, list[float]], time_s: float) -> tuple[float, float, float]:
-	"""Interpolate one sampled trajectory series at a given time."""
-	times = trajectory["time_s"]
-	xs = trajectory["x_m"]
-	ys = trajectory["y_m"]
-	yaws = trajectory["yaw_rad"]
-	if not times:
-		raise ValueError("Trajectory is empty.")
-	if time_s <= times[0]:
-		return xs[0], ys[0], yaws[0]
-	if time_s >= times[-1]:
-		return xs[-1], ys[-1], yaws[-1]
-	for index in range(1, len(times)):
-		if times[index] < time_s:
-			continue
-		left = index - 1
-		span = times[index] - times[left]
-		fraction = 0.0 if span == 0.0 else (time_s - times[left]) / span
-		x = xs[left] + (xs[index] - xs[left]) * fraction
-		y = ys[left] + (ys[index] - ys[left]) * fraction
-		yaw_delta = normalize_angle_rad(yaws[index] - yaws[left])
-		yaw = normalize_angle_rad(yaws[left] + yaw_delta * fraction)
-		return x, y, yaw
-	return xs[-1], ys[-1], yaws[-1]
+def interpolate_trajectory(trajectory, time_s, interpolation_mode=None) -> tuple[float, float, float]:
+    """Interpolate sampled motion with the actor's selected time/distance model."""
+    times = trajectory["time_s"]
+    xs, ys, yaws = trajectory["x_m"], trajectory["y_m"], trajectory["yaw_rad"]
+    if not times:
+        raise ValueError("Trajectory is empty.")
+    if time_s <= times[0]:
+        return xs[0], ys[0], yaws[0]
+    if time_s >= times[-1]:
+        return xs[-1], ys[-1], yaws[-1]
+    index = bisect_left(times, time_s)
+    left = index - 1
+    span = times[index] - times[left]
+    fraction = 0.0 if span == 0.0 else (time_s - times[left]) / span
+    progress = fraction
+    if (interpolation_mode or trajectory.get("interpolation_mode")) == "kinematic":
+        v0, v1 = trajectory["speed_mps"][left], trajectory["speed_mps"][index]
+        if v0 + v1 > 1e-9:
+            progress = (2 * v0 * fraction + (v1 - v0) * fraction**2) / (v0 + v1)
+    x = xs[left] + (xs[index] - xs[left]) * progress
+    y = ys[left] + (ys[index] - ys[left]) * progress
+    yaw = normalize_angle_rad(yaws[left] + normalize_angle_rad(yaws[index] - yaws[left]) * fraction)
+    return x, y, yaw

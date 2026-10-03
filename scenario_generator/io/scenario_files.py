@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from bisect import bisect_right
 import json
 import math
 import os
@@ -721,57 +722,60 @@ def lane_cross_sections_for_road(
     samples: list[tuple[float, float, float, float]],
 ) -> list[LaneCrossSection]:
     """Return the active lane layout at every sampled road position."""
-    profiles: list[LaneCrossSection] = []
+    def polynomial(entries, start_key):
+        entries = sorted(entries, key=lambda e: float(e.get(start_key, 0)))
+        starts = [float(e.get(start_key, 0)) for e in entries]
+        coefficients = [tuple(float(e.get(k, 0)) for k in ("a", "b", "c", "d")) for e in entries]
+        def evaluate(position):
+            index = bisect_right(starts, position + 1e-9) - 1
+            if index < 0:
+                return 0.0
+            return polynomial_value(coefficients[index], position - starts[index])
+        return evaluate
+
+    def speed_profile(elements, start_key):
+        elements = sorted(elements, key=lambda e: float(e.get(start_key, 0)))
+        starts = [float(e.get(start_key, 0)) for e in elements]
+        values = [speed_limit_mps(e if start_key == "sOffset" else child_by_local_name(e, "speed")) for e in elements]
+        def evaluate(position):
+            index = bisect_right(starts, position + 1e-9) - 1
+            return values[index] if index >= 0 else None
+        return evaluate
+
+    lanes = child_by_local_name(road, "lanes")
+    offsets = polynomial([e for e in lanes if xml_local_name(e.tag) == "laneOffset"] if lanes is not None else [], "s")
+    elevation = polynomial(list(child_by_local_name(road, "elevationProfile")) if child_by_local_name(road, "elevationProfile") is not None else [], "s")
+    lateral = child_by_local_name(road, "lateralProfile")
+    superelevation = polynomial([e for e in lateral if xml_local_name(e.tag) == "superelevation"] if lateral is not None else [], "s")
+    road_speed = speed_profile([e for e in road if xml_local_name(e.tag) == "type"], "s")
+    section_data = {}
+    for section in sections:
+        data = []
+        for side_name in ("left", "right"):
+            side = child_by_local_name(section, side_name)
+            for lane in side if side is not None else []:
+                if xml_local_name(lane.tag) != "lane" or int(lane.get("id", 0)) == 0:
+                    continue
+                data.append((int(lane.get("id")), lane.get("type", "driving").lower(),
+                             polynomial([e for e in lane if xml_local_name(e.tag) == "width"], "sOffset"),
+                             speed_profile([e for e in lane if xml_local_name(e.tag) == "speed"], "sOffset")))
+        section_data[id(section)] = data
+    profiles = []
     for road_s, x_m, y_m, heading_rad in samples:
         section = lane_section_at(sections, road_s)
         if section is None:
             continue
-        section_s = float(section.attrib.get("s", "0"))
-        lane_widths: dict[int, float] = {}
-        lane_types: dict[int, str] = {}
-        lane_speed_limits: dict[int, float] = {}
-        for side_name in ("left", "right"):
-            side = child_by_local_name(section, side_name)
-            if side is None:
-                continue
-            for lane in side:
-                if xml_local_name(lane.tag) != "lane":
-                    continue
-                lane_id = int(lane.attrib.get("id", "0"))
-                if lane_id == 0:
-                    continue
-                lane_widths[lane_id] = max(0.0, lane_width_at(lane, section_s, road_s))
-                lane_types[lane_id] = lane.attrib.get("type", "driving").lower()
-                lane_speed_limit = lane_speed_limit_at(
-                    lane, section_s, road_s
-                )
-                if lane_speed_limit is not None:
-                    lane_speed_limits[lane_id] = lane_speed_limit
-        profiles.append(
-            LaneCrossSection(
-                s_m=road_s,
-                x_m=x_m,
-                y_m=y_m,
-                heading_rad=heading_rad,
-                lane_offset_m=road_lane_offset(road, road_s),
-                lane_widths_m=lane_widths,
-                lane_types=lane_types,
-                lane_speed_limits_mps=lane_speed_limits,
-                road_speed_limit_mps=road_speed_limit_at(road, road_s),
-                elevation_m=road_profile_value(
-                    road,
-                    "elevationProfile",
-                    "elevation",
-                    road_s,
-                ),
-                superelevation_rad=road_profile_value(
-                    road,
-                    "lateralProfile",
-                    "superelevation",
-                    road_s,
-                ),
-            ),
-        )
+        local_s = max(0, road_s - float(section.get("s", 0)))
+        widths, types, speeds = {}, {}, {}
+        for lane_id, lane_type, width_at, speed_at in section_data[id(section)]:
+            widths[lane_id], types[lane_id] = max(0, width_at(local_s)), lane_type
+            speed = speed_at(local_s)
+            if speed is not None:
+                speeds[lane_id] = speed
+        profiles.append(LaneCrossSection(s_m=road_s, x_m=x_m, y_m=y_m, heading_rad=heading_rad,
+                         lane_offset_m=offsets(road_s), lane_widths_m=widths, lane_types=types,
+                         lane_speed_limits_mps=speeds, road_speed_limit_mps=road_speed(road_s),
+                         elevation_m=elevation(road_s), superelevation_rad=superelevation(road_s)))
     return profiles
 
 
@@ -1042,10 +1046,11 @@ def append_imported_reference_polyline(
     road: ET.Element,
     road_name: str,
     samples: list[tuple[float, float, float, float]],
+    tolerance_m: float | None = None,
 ) -> list[ET.Element]:
     reference_points = simplify_polyline(
         [(x, y) for _s, x, y, _heading in samples],
-        load_map_export_max_lateral_deviation_m(),
+        load_map_export_max_lateral_deviation_m() if tolerance_m is None else tolerance_m,
     )
     sections = lane_sections_for_road(road)
     profiles = lane_cross_sections_for_road(road, sections, samples)
@@ -1135,12 +1140,13 @@ def append_imported_road(
     polylines: list[MapPolyline],
     road: ET.Element,
     include_helpers: bool = True,
+    tolerance_m: float | None = None,
 ):
     samples = add_lane_transition_samples(road, road_plan_view_samples(road))
     if len(samples) < 2:
         return
     road_name = road_name_for_import(road, len(polylines))
-    sections = append_imported_reference_polyline(polylines, road, road_name, samples)
+    sections = append_imported_reference_polyline(polylines, road, road_name, samples, tolerance_m)
     if not include_helpers or not sections:
         return
     append_imported_outer_polylines(polylines, road, road_name, sections, samples)
@@ -1154,10 +1160,11 @@ def load_xodr_map(input_path: Path, include_helpers: bool = True) -> list[MapPol
     if road_count > MAX_IMPORTED_ROADS:
         raise ValueError(f"Map exceeds the limit of {MAX_IMPORTED_ROADS} roads.")
     total_points = 0
+    tolerance_m = load_map_export_max_lateral_deviation_m()
     for road in root.iter():
         if xml_local_name(road.tag) == "road":
             previous_polyline_count = len(polylines)
-            append_imported_road(polylines, road, include_helpers=include_helpers)
+            append_imported_road(polylines, road, include_helpers=include_helpers, tolerance_m=tolerance_m)
             total_points += sum(
                 len(polyline.points) for polyline in polylines[previous_polyline_count:]
             )
@@ -1461,12 +1468,16 @@ def write_xodr_map(
     output_path: Path,
     polylines: list[MapPolyline],
     max_lateral_deviation_m: float | None = None,
+    frame=None,
 ):
     editable_polylines = exportable_map_polylines(polylines)
     if not editable_polylines:
         raise ValueError("A map needs at least one line with two points.")
     root = ET.Element("OpenDRIVE")
-    ET.SubElement(root, "header", revMajor="1", revMinor="6", name=output_path.stem)
+    header = ET.SubElement(root, "header", revMajor="1", revMinor="6", name=output_path.stem)
+    if frame is not None:
+        from scenario_generator.map.georeference import append_frame
+        append_frame(header, frame)
     road_ids = open_drive_road_ids(editable_polylines)
     roads_by_relation_key = road_relation_lookup(editable_polylines)
     tolerance_m = (
@@ -1520,6 +1531,7 @@ def write_scenario_config(
 	map_path: Path | None,
 	detection_gaps: list[DetectionGap] | None = None,
 	additional_scenario_information: dict[str, object] | None = None,
+	workspace: dict[str, object] | None = None,
 ):
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	serialized_map_path = None
@@ -1531,7 +1543,8 @@ def write_scenario_config(
 		except ValueError:
 			serialized_map_path = str(absolute_map_path)
 	config = {
-		"version": 4,
+		"version": 5,
+		"workspace": workspace or {},
 		"map_path": serialized_map_path,
 		"detection_gaps": [
 			{"vehicle_name": gap.vehicle_name, "start_time_s": gap.start_time_s, "end_time_s": gap.end_time_s}
