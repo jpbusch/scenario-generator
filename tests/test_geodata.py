@@ -13,12 +13,13 @@ from fastapi import HTTPException, UploadFile
 import numpy as np
 import pytest
 from rasterio.io import MemoryFile
+from shapely.geometry import LineString
 
 from scenario_generator.io.scenario_files import write_xodr_map, load_xodr_reference_map
 from scenario_generator.map.georeference import MapFrame, read_xodr_frame
 from scenario_generator.map.lanelet import LaneletLayer
 from scenario_generator.map.map import MapPolyline
-from scenario_generator.map.motion import generate_motion
+from scenario_generator.map.motion import ROUTE_GEOMETRY_TOLERANCE_M, generate_motion
 from scenario_generator.map.orthophoto import OrthophotoCache
 from scenario_generator.map.routing import LaneGraph, xodr_graph
 from scenario_generator.scenario_elements.road_user.trajectory import (
@@ -196,6 +197,67 @@ def test_motion_includes_geometry_and_profile_events():
         assert math.dist((a.x_m, a.y_m), (b.x_m, b.y_m)) == pytest.approx(
             (a.speed_mps + b.speed_mps) * (b.time_s - a.time_s) / 2, abs=1e-7
         )
+
+
+def test_motion_drops_redundant_straight_vertices_without_changing_motion():
+    parameters = {"start_time_s": 3, "start_speed_mps": 10,
+                  "end_speed_mps": 10, "reference_speed_mps": 10, "dt_s": 1}
+    dense, dense_summary = generate_motion([(i / 10, 0) for i in range(1026)], parameters)
+    sparse, sparse_summary = generate_motion([(0, 0), (102.5, 0)], parameters)
+    assert dense == sparse
+    assert dense_summary == sparse_summary
+    assert [p.time_s for p in dense] == [*range(3, 14), 13.25]
+
+
+def test_motion_reduces_dense_curves_with_bounded_geometry_error():
+    route = [(50 * math.cos(i * math.pi / 2000),
+              50 * math.sin(i * math.pi / 2000)) for i in range(1001)]
+    points, summary = generate_motion(route, {"start_speed_mps": 10,
+        "end_speed_mps": 10, "reference_speed_mps": 10, "dt_s": 1})
+    assert len(points) < len(route) / 10
+    assert (points[0].x_m, points[0].y_m) == route[0]
+    assert (points[-1].x_m, points[-1].y_m) == route[-1]
+    sampled = LineString([(p.x_m, p.y_m) for p in points])
+    original = LineString(route)
+    assert original.hausdorff_distance(sampled) <= ROUTE_GEOMETRY_TOLERANCE_M
+    assert summary["length_m"] == pytest.approx(sampled.length)
+    assert points[-1].time_s == pytest.approx(sampled.length / 10)
+    for a, b in zip(points, points[1:]):
+        assert 0 < b.time_s - a.time_s <= 1 + 1e-8
+        assert math.dist((a.x_m, a.y_m), (b.x_m, b.y_m)) == pytest.approx(
+            (a.speed_mps + b.speed_mps) * (b.time_s - a.time_s) / 2, abs=1e-7)
+
+
+def test_motion_keeps_exact_acceleration_braking_events_after_reduction():
+    parameters = {"start_time_s": 3, "start_speed_mps": 0, "end_speed_mps": 0,
+                  "reference_speed_mps": 7, "acceleration_mps2": 2,
+                  "deceleration_mps2": 2, "dt_s": 1}
+    dense, summary = generate_motion([(i / 10, 0) for i in range(601)], parameters)
+    sparse, _ = generate_motion([(0, 0), (60, 0)], parameters)
+    assert dense == sparse
+    assert any(p.time_s == pytest.approx(6.5) and p.speed_mps == 7 for p in dense)
+    assert any(p.time_s == pytest.approx(3 + summary["duration_s"] - 3.5)
+               and p.speed_mps == 7 for p in dense)
+    assert dense[-1] == Waypoint(3 + summary["duration_s"], 60, 0, 0)
+
+
+def test_motion_reduction_preserves_turns_and_backtracking():
+    route = [(0, 0), (5, 0), (10, 0), (10, 5), (10, 10), (10, 5), (10, 0), (0, 0)]
+    points, summary = generate_motion(route, {"start_speed_mps": 5,
+        "end_speed_mps": 5, "reference_speed_mps": 5, "dt_s": 1})
+    assert summary["length_m"] == 40
+    assert points[-1].time_s == 8
+    assert [(p.x_m, p.y_m) for p in points] == route[:-1] + [(5, 0), (0, 0)]
+
+
+def test_motion_limit_counts_retained_samples(monkeypatch):
+    monkeypatch.setattr("scenario_generator.map.motion.MAX_WAYPOINTS_PER_ACTOR", 11)
+    parameters = {"start_speed_mps": 10, "end_speed_mps": 10,
+                  "reference_speed_mps": 10, "dt_s": 1}
+    points, _ = generate_motion([(i / 10, 0) for i in range(1001)], parameters)
+    assert len(points) == 11
+    with pytest.raises(ValueError, match="waypoint limit"):
+        generate_motion([(0, 0), (0, 5), (95, 5)], parameters)
 
 
 def test_kinematic_interpolation_between_samples_and_mutable_legacy_points():

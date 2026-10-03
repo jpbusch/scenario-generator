@@ -5,11 +5,17 @@ from __future__ import annotations
 from bisect import bisect_right
 import math
 
+from shapely.geometry import LineString
+
 from scenario_generator.io.import_validation import (
     MAX_WAYPOINTS_PER_ACTOR,
     finite_number,
 )
 from scenario_generator.scenario_elements.road_user.trajectory import Waypoint
+
+
+# Remove redundant map vertices without visibly changing the routed path.
+ROUTE_GEOMETRY_TOLERANCE_M = 0.01
 
 
 def cumulative_lengths(points):
@@ -49,6 +55,10 @@ def generate_motion(points, parameters):
         )
     if vr < max(v0, ve):
         raise ValueError("Reference speed must be at least the start and end speed.")
+    if len(points) > 2:
+        points = list(
+            LineString(points).simplify(ROUTE_GEOMETRY_TOLERANCE_M).coords
+        )
     lengths = cumulative_lengths(points)
     distance = lengths[-1]
     if distance <= 1e-6:
@@ -60,7 +70,7 @@ def generate_motion(points, parameters):
     dc = max(0, distance - da - db)
     ta, tc, tb = (peak - v0) / a, dc / peak, (peak - ve) / b
     duration = ta + tc + tb
-    if duration / dt + len(points) + 5 > MAX_WAYPOINTS_PER_ACTOR:
+    if math.ceil(duration / dt) + 1 > MAX_WAYPOINTS_PER_ACTOR:
         raise ValueError(
             "Sampling would exceed the waypoint limit; increase the sampling interval."
         )
@@ -95,6 +105,10 @@ def generate_motion(points, parameters):
             s, speed = da + dc + peak * u - b * u**2 / 2, peak - b * u
         x, y = point_at(points, lengths, min(distance, s))
         waypoints.append(Waypoint(t0 + t, x, y, max(0, speed)))
+        if len(waypoints) > MAX_WAYPOINTS_PER_ACTOR:
+            raise ValueError(
+                "Sampling would exceed the waypoint limit; increase the sampling interval."
+            )
     waypoints[-1] = Waypoint(t0 + duration, *points[-1], ve)
     return waypoints, {
         "length_m": distance,

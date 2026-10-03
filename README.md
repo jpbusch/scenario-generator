@@ -100,7 +100,9 @@ restarting: editor sessions themselves remain temporary, as in the original app.
 4. Select a vehicle and enable **Route** in **Editing controls**. In **Routing
    settings**, choose the map and set end/reference speeds in km/h and positive
    acceleration/braking in m/s². The existing **Time step [s]** sets the sampling
-   interval. Start time and speed are inherited from the last waypoint.
+   interval. Additional points retain relevant geometry and exact speed-profile
+   transitions and targets. Redundant geometry vertices are removed with a 1 cm
+   tolerance. Start time and speed are inherited from the last waypoint.
 5. Click the next target on the canvas to append a route. More target clicks
    extend it in order; no preview/apply step is required. For an empty trajectory,
    the first click sets the start using the configured start time/speed. Select

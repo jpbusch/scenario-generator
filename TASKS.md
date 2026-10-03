@@ -10,6 +10,14 @@
 | Section interpolation and persistence | Done | Preserve previous curves; mixed manual/kinematic editing, playback and export roundtrips |
 | Middle-button delete | Done | Delete exactly one last waypoint without dragging or browser autoscroll |
 | Integrated regression and performance checks | Done | Python, Playwright, lint, wheel and large-map cache checks; results recorded below |
+| Reduce redundant routed waypoints | Done | Simplify route geometry within 1 cm; retain exact endpoints/profile events and consistent position/time/speed |
+
+### Reduced route sampling — results (2026-10-03)
+
+- Simplify the route polyline with a **0.01 m** tolerance before calculating its length and analytical motion profile. Straight collinear map vertices disappear; relevant curve vertices remain. The time raster, exact acceleration/cruise/braking transitions and each appended target are retained. The profile uses the simplified path length, so sampled distances still agree with integrated speeds. Existing trajectories are unchanged; this affects newly generated routes only.
+- Compare against commit `298a375` with the same routes used in `tests/e2e/benchmark-large-maps.js`, both example maps loaded, **1 s** sampling, 0 → 30 → 0 km/h and 2 m/s² acceleration/braking. XODR lane `19515:0:1`: **533 → 74** points (86.1% fewer), maximum polyline deviation **9.79 mm**, duration change **−0.291 ms**. Lanelet2 lane `10043980`: **59 → 56** points, maximum deviation **6.90 mm**, duration change **−0.0033 ms**. Example files remain unchanged and unversioned.
+- Dense deterministic examples at 10 m/s and 1 s sampling: a 102.5 m straight route reduces **1,026 → 12** points, and a 50 m radius quarter-circle reduces **1,008 → 72** points. Straight-route timestamps and motion are identical to generating from just its two endpoints. Waypoint limits now count retained samples rather than discarded map vertices.
+- **205 Python tests pass**, including five new checks for straight/curved reduction, bounded deviation, position/speed consistency, exact profile changes/targets, backtracking and waypoint limits. **8 relevant Playwright tests pass** against an isolated updated server on port 18000 (routing, ordered appends, layer integration, error handling and controls). Ruff and wheel build pass. The running Compose server on port 8000 was left in place to preserve its in-memory editing sessions; save the project before restarting it to activate this backend change.
 
 
 ### Integrated controls — results (2026-10-03)

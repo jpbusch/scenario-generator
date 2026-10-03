@@ -12,6 +12,8 @@
    For vehicles, enable **Route** in Editing controls to append a routed segment
    from the last point with each target click. **Routing settings** configures its
    map and speed profile; **Time step [s]** controls the sampling interval.
+   Extra points preserve geometry, speed-profile changes and exact targets;
+   redundant geometry vertices are removed with a 1 cm tolerance.
    With an empty trajectory the first click sets the start.
 4. Use the **Export controls** and **Additional scenario information** panels for metadata, environmental information, quality checks, and exports.
 
