@@ -134,7 +134,17 @@ def load_trajectory_json(input_path: Path) -> dict[str, list[Waypoint]]:
             raise ValueError(  # noqa: TRY004 - invalid imported data uses the loader error contract.
                 f"{raw_name}: trajectory must be an object.",
             )
-        waypoints = waypoints_from_trajectory(raw_trajectory)
+        if "control_waypoints" in raw_trajectory:
+            values = raw_trajectory["control_waypoints"]
+            if not isinstance(values, list) or len(values) > MAX_WAYPOINTS_PER_ACTOR:
+                raise ValueError("Invalid control waypoint list.")
+            waypoints = [Waypoint(time_s=finite_number(point["time_s"], "Waypoint time"),
+                                  x_m=finite_number(point["x_m"], "Waypoint X"),
+                                  y_m=finite_number(point["y_m"], "Waypoint Y"),
+                                  speed_mps=None if point.get("speed_mps") is None else finite_number(point["speed_mps"], "Waypoint speed"))
+                         for point in values]
+        else:
+            waypoints = waypoints_from_trajectory(raw_trajectory)
         total_waypoints += len(waypoints)
         if total_waypoints > MAX_TOTAL_WAYPOINTS:
             raise ValueError(
@@ -1662,14 +1672,16 @@ def load_scenario_config(
 			key=lambda waypoint: waypoint.time_s,
 		)
 		loaded_waypoints = vehicles[name]
+		options = config.get("workspace", {}).get("actors", {}).get(name, {})
 		if len(loaded_waypoints) == 1:
-			loaded_waypoints[0].speed_mps = 0.0
+			if not options.get("routing_settings"):
+				loaded_waypoints[0].speed_mps = 0.0
 		elif len(loaded_waypoints) >= 2:
-			trajectory = Trajectory(waypoints=loaded_waypoints)
-			fallback_speeds, _adjusted = Trajectory.anchored_waypoint_speeds(
-				trajectory.segment_average_speeds(),
-				trajectory.initial_speed_mps(),
-			)
+			trajectory = Trajectory(waypoints=loaded_waypoints,
+			                       interpolation_mode=options.get("interpolation_mode", "smooth"),
+			                       interpolation_sections=options.get("interpolation_sections", []))
+			trajectory.validate_sections()
+			fallback_speeds, _adjusted = trajectory.resolved_waypoint_speeds()
 			for index, waypoint in enumerate(loaded_waypoints):
 				if waypoint.speed_mps is None:
 					waypoint.speed_mps = fallback_speeds[index]

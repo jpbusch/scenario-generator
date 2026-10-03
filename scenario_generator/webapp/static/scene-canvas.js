@@ -157,7 +157,7 @@ function positionAt(actor, timeS) {
       const span = curve.time_s[index] - curve.time_s[previous];
       const fraction = span ? (timeS - curve.time_s[previous]) / span : 0;
       let progress = fraction;
-      if (actor.trajectory_options?.interpolation_mode === "kinematic") {
+      if ((curve.interval_modes?.[previous] || actor.trajectory_options?.interpolation_mode) === "kinematic") {
         const v0 = curve.speed_mps[previous], v1 = curve.speed_mps[index];
         if (v0 + v1 > 1e-9) progress = (2 * v0 * fraction + (v1 - v0) * fraction ** 2) / (v0 + v1);
       }
@@ -204,7 +204,7 @@ function drawScene() {
   const mainContext = context;
   const mainTransform = transform;
   const mapKey = JSON.stringify([state.scenario.map.revision, view.canvas.width, view.canvas.height,
-    ...["show_map", "show_map_helpers", "show_road_centerlines", "show_lane_numbers", "show_road_points", "show_lanelet", "show_origins", "map_opacity"].map((key) => state.scenario.settings[key])]);
+    ...["show_map", "show_map_helpers", "show_road_centerlines", "show_lane_numbers", "show_road_points", "show_lanelet", "show_xodr_origin", "show_lanelet_origin", "map_opacity", "lanelet_opacity"].map((key) => state.scenario.settings[key])]);
   const raster = state.mapRaster;
   const visibleMaxX = view.minX + view.canvas.width / devicePixelRatio / view.scale;
   const contained = raster && view.minX >= raster.minX && view.minY >= raster.minY && visibleMaxX <= raster.maxX && maxY <= raster.maxY;
@@ -278,7 +278,8 @@ function drawScene() {
   context.drawImage(state.staticMapCanvas, mapX, mapY, state.staticMapCanvas.width / devicePixelRatio * mapScale, state.staticMapCanvas.height / devicePixelRatio * mapScale);
   state.labelTargets.push(...(state.staticMapLabels || []).map((label) => ({ ...label, x: label.x * mapScale + mapX, y: label.y * mapScale + mapY, width: label.width * mapScale, height: label.height * mapScale })));
   if (typeof drawRoutePreview === "function") drawRoutePreview(context, transform);
-  if (state.scenario.settings.show_road_connections) {
+  if (state.scenario.settings.show_map && state.scenario.settings.show_road_connections) {
+    context.save(); context.globalAlpha = state.scenario.settings.map_opacity;
     const roadsByName = new Map(state.scenario.map.roads.map((road) => [road.name, road]));
     state.scenario.map.roads.forEach((road) => {
       const successor = roadsByName.get(road.successor_road); if (!successor || !road.points.length || !successor.points.length) return;
@@ -293,6 +294,7 @@ function drawScene() {
       context.fillStyle = "#e8fff1"; context.strokeStyle = "#007c91"; context.lineWidth = 2;
       context.beginPath(); context.arc(...source, 5, 0, Math.PI * 2); context.fill(); context.stroke();
     });
+    context.restore();
   }
   state.scenario.actors.forEach((actor) => {
     const color = actorColor(actor);
@@ -492,7 +494,6 @@ async function editCanvasLabel(target) {
 
 /** Apply the active canvas tool at an exact world coordinate for pointer and keyboard users. */
 async function activateCanvasPoint(x_m, y_m) {
-  if (state.routePick) { pickRoutePoint(x_m, y_m); return; }
   const actor = selectedActor();
   if (!actor) return;
   const view = state.view;
@@ -542,6 +543,8 @@ async function activateCanvasPoint(x_m, y_m) {
     const point = snappedRoadPoint(x_m, y_m, road);
     await api(`/api/map/roads/${road}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ points: [...points, point] }) });
     await refresh();
+  } else if (state.routeMode) {
+    await appendRouteTarget(x_m, y_m);
   } else {
     await api(`/api/actors/${actor.name}/waypoints`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ x_m, y_m, snap_distance_m: state.scenario.settings.lane_snap_enabled ? 16 / view.scale : 0 }) });
     await refresh(actor.name);
@@ -550,6 +553,7 @@ async function activateCanvasPoint(x_m, y_m) {
 
 // A canvas click is routed through label selection and then the shared coordinate action.
 $("#map-canvas").onclick = async (event) => {
+  if (event.button !== 0) return;
   if (state.didDrag || state.suppressCanvasClick) { state.didDrag = false; state.suppressCanvasClick = false; return; }
   if (!state.scenario.settings.map_mode) {
     const labelTarget = canvasLabelTarget(event);
@@ -817,6 +821,11 @@ function circleFromPoints(first, second, third) {
 
 // Pointer gestures keep previews local and persist geometry only when released.
 $("#map-canvas").onpointerdown = (event) => {
+  if (event.button === 1) {
+    event.preventDefault();
+    if (!state.scenario.settings.map_mode) deleteLastWaypoint();
+    return;
+  }
   if (state.keyboardCursorVisible) {
     state.keyboardCursorVisible = false;
     draw();
@@ -842,6 +851,8 @@ $("#map-canvas").onpointerdown = (event) => {
   state.dragTarget = { ...target, kind: "actor", startClientX: event.clientX, startClientY: event.clientY }; state.selected = target.actor.name; state.didDrag = false;
   event.currentTarget.setPointerCapture(event.pointerId); event.preventDefault();
 };
+
+$("#map-canvas").onauxclick = (event) => { if (event.button === 1) event.preventDefault(); };
 
 $("#map-canvas").onpointermove = (event) => {
   if (state.panStart) {

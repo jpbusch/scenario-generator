@@ -100,7 +100,16 @@ async function loadSelectedDefault(kind) {
 $("#load-default-scenario").onclick = () => loadSelectedDefault("scenario");
 $("#load-default-map").onclick = () => loadSelectedDefault("map");
 $("#scenario-load-button").onclick = () => $("#scenario-load-dialog").showModal();
-$("#map-load-button").onclick = () => $("#map-load-dialog").showModal();
+function renderMapLoadOptions() {
+  const lanelet = $("#map-type").value === "lanelet2";
+  $("#xodr-load-options").hidden = lanelet;
+  $("#load-default-map").hidden = lanelet;
+  $("#lanelet-remove").hidden = !lanelet;
+  $("#lanelet-remove").disabled = !state.scenario?.geodata.lanelet_path;
+  $("#map-upload-button").textContent = lanelet ? "Upload Lanelet2" : "Upload map";
+}
+$("#map-type").onchange = renderMapLoadOptions;
+$("#map-load-button").onclick = () => { renderMapLoadOptions(); $("#map-load-dialog").showModal(); };
 $("#close-scenario-load").onclick = () => $("#scenario-load-dialog").close();
 $("#close-map-load").onclick = () => $("#map-load-dialog").close();
 ["scenario", "map"].forEach((kind) => {
@@ -115,7 +124,7 @@ $("#scenario-upload-button").onclick = () => {
 };
 $("#map-upload-button").onclick = () => {
   $("#map-load-dialog").close();
-  $("#map-upload").click();
+  $($("#map-type").value === "lanelet2" ? "#lanelet-upload" : "#map-upload").click();
 };
 populateDefaultSelector("scenario");
 populateDefaultSelector("map");

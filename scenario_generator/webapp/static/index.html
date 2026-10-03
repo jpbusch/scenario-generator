@@ -87,7 +87,56 @@
           <button id="fit-view">Fit view</button>
           <details>
             <summary>View</summary>
-            <div id="view-options"></div>
+            <div id="view-options">
+              <section id="map-view-options" class="view-option-group">
+                <h3>Map view</h3>
+                <section class="map-layer-options">
+                  <div class="layer-heading">
+                    <label class="check-label"><input id="view-show_map" type="checkbox" /><span>XODR</span></label>
+                    <button type="button" class="layer-disclosure" aria-label="XODR settings" aria-expanded="false" aria-controls="xodr-view-options">▸</button>
+                  </div>
+                  <div id="xodr-view-options" class="layer-settings" hidden>
+                    <label class="check-label"><input id="view-show_road_connections" type="checkbox" /><span>Road connections</span></label>
+                    <label class="check-label"><input id="view-show_road_points" type="checkbox" /><span>Road points</span></label>
+                    <label class="check-label"><input id="view-show_lane_numbers" type="checkbox" /><span>Lane numbers</span></label>
+                    <label class="check-label"><input id="view-show_road_centerlines" type="checkbox" /><span>Road centerlines</span></label>
+                    <label class="check-label"><input id="view-show_map_helpers" type="checkbox" /><span>Map helper lines</span></label>
+                    <label>XODR opacity<input id="map-opacity" type="range" min="0" max="1" step="0.05" /></label>
+                    <label class="check-label"><input id="show-xodr-origin" type="checkbox" /><span>XODR origin</span></label>
+                    <p id="georeference-summary"></p>
+                    <details id="frame-settings"><summary>Set map georeference</summary>
+                      <label>Projected CRS<input id="frame-crs" placeholder="EPSG:25832 or PROJ definition" /></label>
+                      <label>Projected origin X (m)<input id="frame-x" type="number" step="any" value="0" /></label>
+                      <label>Projected origin Y (m)<input id="frame-y" type="number" step="any" value="0" /></label>
+                      <label>Frame rotation (rad)<input id="frame-heading" type="number" step="any" value="0" /></label>
+                      <button id="frame-apply" type="button">Apply georeference</button>
+                    </details>
+                  </div>
+                </section>
+                <section class="map-layer-options">
+                  <div class="layer-heading">
+                    <label class="check-label"><input id="show-lanelet" type="checkbox" /><span>Lanelet2</span></label>
+                    <button type="button" class="layer-disclosure" aria-label="Lanelet2 settings" aria-expanded="false" aria-controls="lanelet-view-options">▸</button>
+                  </div>
+                  <div id="lanelet-view-options" class="layer-settings" hidden>
+                    <label>Lanelet2 opacity<input id="lanelet-opacity" type="range" min="0" max="1" step="0.05" /></label>
+                    <label class="check-label"><input id="show-lanelet-origin" type="checkbox" /><span>Lanelet2 origin</span></label>
+                    <p id="lanelet-origin-summary"></p>
+                  </div>
+                </section>
+                <section class="map-layer-options">
+                  <div class="layer-heading">
+                    <label class="check-label"><input id="show-orthophoto" type="checkbox" /><span>Orthophoto</span></label>
+                    <button type="button" class="layer-disclosure" aria-label="Orthophoto settings" aria-expanded="false" aria-controls="orthophoto-view-options">▸</button>
+                  </div>
+                  <div id="orthophoto-view-options" class="layer-settings" hidden>
+                    <label>Orthophoto opacity<input id="orthophoto-opacity" type="range" min="0" max="1" step="0.05" /></label>
+                    <p id="imagery-status" role="status" aria-live="polite"></p>
+                    <a href="https://www.bezreg-koeln.nrw.de/geobasis-nrw" target="_blank" rel="noopener noreferrer">Orthophotos: Geobasis NRW, Land NRW</a>
+                  </div>
+                </section>
+              </section>
+            </div>
           </details>
           <details id="measurement-options">
             <summary>Measure</summary>
@@ -257,6 +306,24 @@
             Timing edits: forward
           </button>
           <button id="waypoint-timing">New points: fixed time step</button>
+          <div id="route-controls">
+            <label class="check-label"><input id="route-mode" type="checkbox" /><span>Route</span></label>
+            <details id="routing-settings" class="additional-info">
+              <summary>Routing settings</summary>
+              <label>Routing map<select id="route-source"><option value="xodr">OpenDRIVE</option><option value="lanelet2">Lanelet2</option></select></label>
+              <label>Start lane / direction<select id="route-lane"><option value="">Automatic</option></select></label>
+              <div class="route-profile-fields">
+                <label>Start time (s)<input id="route-start-time" type="number" min="0" step="0.1" value="0" /></label>
+                <label>Start speed (km/h)<input id="route-start-speed" type="number" min="0" step="1" value="30" /></label>
+                <label>End speed (km/h)<input id="route-end-speed" type="number" min="0" step="1" value="30" /></label>
+                <label>Reference speed (km/h)<input id="route-reference-speed" type="number" min="0.1" step="1" value="30" /></label>
+                <label>Acceleration (m/s²)<input id="route-acceleration" type="number" min="0.01" step="0.1" value="2" /></label>
+                <label>Braking (m/s²)<input id="route-deceleration" type="number" min="0.01" step="0.1" value="2" /></label>
+              </div>
+              <p>Click successive targets to extend the trajectory. Time step sets the sampling interval. End speed 0 stops at each target.</p>
+            </details>
+            <p id="route-summary" role="status" aria-live="polite"></p>
+          </div>
           <label id="lane-snap-control" class="check-label">
             <input id="lane-snap" type="checkbox" />
             <span>Snap points to lane</span>
@@ -278,47 +345,6 @@
           </div>
         </div>
         <hr />
-        <details id="geographic-layers" class="additional-info">
-          <summary>Geographic layers</summary>
-          <button id="lanelet-load" type="button">Import Lanelet2 (.osm)</button>
-          <input id="lanelet-upload" class="visually-hidden" type="file" accept=".osm" aria-label="Choose Lanelet2 map" tabindex="-1" />
-          <button id="lanelet-remove" type="button">Remove Lanelet2</button>
-          <label class="check-label"><input id="show-lanelet" type="checkbox" /><span>Lanelet2 boundaries and centerlines</span></label>
-          <label class="check-label"><input id="show-orthophoto" type="checkbox" /><span>NRW orthophotos</span></label>
-          <label>Orthophoto opacity<input id="orthophoto-opacity" type="range" min="0" max="1" step="0.05" /></label>
-          <label>XODR opacity<input id="map-opacity" type="range" min="0" max="1" step="0.05" /></label>
-          <label class="check-label"><input id="show-origins" type="checkbox" /><span>Coordinate origins</span></label>
-          <p id="georeference-summary"></p>
-          <p id="imagery-status" role="status" aria-live="polite"></p>
-          <a href="https://www.bezreg-koeln.nrw.de/geobasis-nrw" target="_blank" rel="noopener noreferrer">Orthophotos: Geobasis NRW, Land NRW</a>
-          <details><summary>Set map georeference</summary>
-            <label>Projected CRS<input id="frame-crs" placeholder="EPSG:25832 or PROJ definition" /></label>
-            <label>Projected origin X (m)<input id="frame-x" type="number" step="any" value="0" /></label>
-            <label>Projected origin Y (m)<input id="frame-y" type="number" step="any" value="0" /></label>
-            <label>Frame rotation (rad)<input id="frame-heading" type="number" step="any" value="0" /></label>
-            <button id="frame-apply" type="button">Apply georeference</button>
-          </details>
-        </details>
-        <details id="route-generator" class="additional-info">
-          <summary>Create vehicle route</summary>
-          <label>Routing map<select id="route-source"><option value="xodr">OpenDRIVE</option><option value="lanelet2">Lanelet2</option></select></label>
-          <label>Point coordinates<select id="route-coordinates"><option value="local">Local X / Y (m)</option><option value="geographic">Longitude / latitude</option></select></label>
-          <label>Start, optional via points, target<textarea id="route-points" rows="4" placeholder="One point per line: X, Y, optional lane ID"></textarea></label>
-          <p>Points follow lane direction. An optional lane ID selects a specific lane; the preview shows the matched lanes.</p>
-          <div class="button-row"><button id="route-pick-start" type="button">Pick start</button><button id="route-pick-via" type="button">Pick via</button><button id="route-pick-target" type="button">Pick target</button><button id="route-pick-cancel" type="button">Cancel picking</button></div>
-          <div class="route-profile-fields">
-            <label>Start time (s)<input id="route-start-time" type="number" min="0" step="0.1" value="0" /></label>
-            <label>Start speed (km/h)<input id="route-start-speed" type="number" min="0" step="1" value="30" /></label>
-            <label>End speed (km/h)<input id="route-end-speed" type="number" min="0" step="1" value="30" /></label>
-            <label>Reference speed (km/h)<input id="route-reference-speed" type="number" min="0.1" step="1" value="30" /></label>
-            <label>Acceleration (m/s²)<input id="route-acceleration" type="number" min="0.01" step="0.1" value="2" /></label>
-            <label>Braking (m/s²)<input id="route-deceleration" type="number" min="0.01" step="0.1" value="2" /></label>
-            <label>Sampling interval (s)<input id="route-dt" type="number" min="0.001" step="0.01" value="0.1" /></label>
-          </div>
-          <button id="route-preview" type="button">Preview route</button>
-          <button id="route-apply" type="button" disabled>Use route for selected actor</button>
-          <p id="route-summary" role="status" aria-live="polite"></p>
-        </details>
         <details class="additional-info">
           <summary>Additional scenario information</summary>
           <label>
@@ -538,14 +564,19 @@
         <div class="panel-title">
           <span id="map-load-dialog-title">Load map</span>
         </div>
+        <label>Map type<select id="map-type"><option value="xodr">OpenDRIVE (.xodr)</option><option value="lanelet2">Lanelet2 (.osm)</option></select></label>
+        <div id="xodr-load-options">
         <label for="default-map-select">Default map</label>
         <select id="default-map-select" aria-describedby="default-map-hint" disabled>
           <option value="">Loading defaults…</option>
         </select>
         <span id="default-map-hint" class="load-hint"></span>
+        </div>
+        <input id="lanelet-upload" class="visually-hidden" type="file" accept=".osm" aria-label="Choose Lanelet2 map" tabindex="-1" />
         <div class="dialog-actions">
           <button id="load-default-map" type="button" disabled>Load default</button>
           <button id="map-upload-button" type="button">Upload map</button>
+          <button id="lanelet-remove" type="button" hidden>Remove Lanelet2</button>
           <button id="close-map-load" type="button">Cancel</button>
         </div>
       </section>

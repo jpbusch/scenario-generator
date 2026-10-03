@@ -22,12 +22,15 @@ def evaluated(method):
     @wraps(method)
     def evaluate(self, *args, **kwargs):
         previous = self._ordered_waypoints
+        previous_sections = self._section_cache
         if previous is None:
             self._ordered_waypoints = sorted(self.waypoints, key=lambda point: point.time_s)
+            self._section_cache = None
         try:
             return method(self, *args, **kwargs)
         finally:
             self._ordered_waypoints = previous
+            self._section_cache = previous_sections
     return evaluate
 
 
@@ -47,11 +50,58 @@ class Trajectory:
     detected: list[bool] | None = None
     parked_yaw_rad: float = 0.0
     interpolation_mode: str = "smooth"
+    interpolation_sections: list[dict] = field(default_factory=list)
     _ordered_waypoints: list[Waypoint] | None = field(default=None, init=False, repr=False)
+    _section_cache: list | None = field(default=None, init=False, repr=False)
 
     PROFILE_DISTANCE_SAMPLES_PER_SEGMENT = load_profile_distance_samples_per_segment()
     MIN_DISTANCE_M = 1e-9
     MIN_SPEED_SUM_MPS = 1e-9
+
+    def validate_sections(self) -> None:
+        """Sections cover consecutive intervals and share their boundary point."""
+        if not self.interpolation_sections:
+            return
+        previous_end = 0
+        for section in self.interpolation_sections:
+            start, end = section.get("first_index"), section.get("last_index")
+            if (type(start) is not int or type(end) is not int
+                    or start != previous_end or not start < end < len(self.waypoints)
+                    or section.get("mode") not in {"smooth", "kinematic"}):
+                raise ValueError("Invalid trajectory interpolation sections.")
+            if "start_speed_mps" in section:
+                speed = float(section["start_speed_mps"])
+                if not math.isfinite(speed) or speed < 0:
+                    raise ValueError("Section start speed must be finite and nonnegative.")
+            previous_end = end
+        if previous_end != len(self.waypoints) - 1:
+            raise ValueError("Interpolation sections must cover the trajectory.")
+
+    def section_trajectories(self):
+        """Evaluate each section without borrowing control points from its neighbours."""
+        if self._section_cache is not None:
+            return iter(self._section_cache)
+        self.validate_sections()
+        points = self.sorted_waypoints()
+        sections = []
+        for section in self.interpolation_sections:
+            first, last = section["first_index"], section["last_index"]
+            local = list(points[first:last + 1])
+            if "start_speed_mps" in section and local[0].speed_mps is None:
+                point = local[0]
+                local[0] = Waypoint(point.time_s, point.x_m, point.y_m, section["start_speed_mps"])
+            trajectory = Trajectory(local, parked_yaw_rad=self.parked_yaw_rad, interpolation_mode=section["mode"])
+            trajectory._ordered_waypoints = local
+            sections.append((first, last, trajectory))
+        if self._ordered_waypoints is not None:
+            self._section_cache = sections
+        return iter(sections)
+
+    def section_for_segment(self, index):
+        for first, last, trajectory in self.section_trajectories():
+            if first <= index < last:
+                return trajectory, index - first
+        raise ValueError("Unknown trajectory segment.")
 
     @evaluated
     def as_series(self) -> dict[str, list[float] | list[bool]]:
@@ -82,6 +132,9 @@ class Trajectory:
         segment_index: int,
         fraction: float,
     ) -> tuple[float, float]:
+        if self.interpolation_sections:
+            trajectory, local = self.section_for_segment(segment_index)
+            return trajectory.curve_point_for_segment(local, fraction)
         waypoints = self.sorted_waypoints()
         last_index = len(waypoints) - 1
         p0 = waypoints[max(segment_index - 1, 0)]
@@ -131,6 +184,9 @@ class Trajectory:
         include_end: bool = True,
     ) -> list[tuple[float, float, float]]:
         """Sample one curve segment with an explicit, time-independent count."""
+        if self.interpolation_sections:
+            trajectory, local = self.section_for_segment(segment_index)
+            return trajectory.sampled_curve_points_for_segment_count(local, sample_count, include_end)
         waypoints = self.sorted_waypoints()
         start = waypoints[segment_index]
         end = waypoints[segment_index + 1]
@@ -170,6 +226,9 @@ class Trajectory:
     @evaluated
     def profile_segment_curve_distance(self, segment_index: int) -> float:
         """Return a stable geometric length used to derive profile timestamps."""
+        if self.interpolation_sections:
+            trajectory, local = self.section_for_segment(segment_index)
+            return trajectory.profile_segment_curve_distance(local)
         if self.interpolation_mode == "kinematic":
             start, end = self.sorted_waypoints()[segment_index:segment_index + 2]
             return math.hypot(end.x_m - start.x_m, end.y_m - start.y_m)
@@ -279,6 +338,13 @@ class Trajectory:
     @evaluated
     def resolved_waypoint_speeds(self) -> tuple[list[float], bool]:
         """Return explicit support speeds or derive them for legacy input."""
+        if self.interpolation_sections:
+            speeds, adjusted = [], False
+            for _first, _last, trajectory in self.section_trajectories():
+                values, changed = trajectory.resolved_waypoint_speeds()
+                speeds.extend(values if not speeds else values[1:])
+                adjusted |= changed
+            return speeds, adjusted
         waypoints = self.sorted_waypoints()
         if all(waypoint.speed_mps is not None for waypoint in waypoints):
             speeds: list[float] = []
@@ -343,6 +409,15 @@ class Trajectory:
     def as_moving_series(self) -> dict[str, list[float] | list[bool]]:
         waypoints = self.sorted_waypoints()
         self.validate_moving_waypoints(waypoints)
+        if self.interpolation_sections:
+            series = {key: [] for key in ("time_s", "x_m", "y_m", "speed_mps", "yaw_rad", "interval_modes")}
+            for _first, _last, trajectory in self.section_trajectories():
+                part = trajectory.as_moving_series()
+                skip = 1 if series["time_s"] else 0
+                for key in ("time_s", "x_m", "y_m", "speed_mps", "yaw_rad"):
+                    series[key].extend(part[key][skip:])
+                series["interval_modes"].extend([trajectory.interpolation_mode] * (len(part["time_s"]) - 1))
+            return series
         if self.interpolation_mode == "kinematic":
             xs, ys = [p.x_m for p in waypoints], [p.y_m for p in waypoints]
             return {"time_s": [p.time_s for p in waypoints], "x_m": xs, "y_m": ys,
@@ -439,7 +514,9 @@ def interpolate_trajectory(trajectory, time_s, interpolation_mode=None) -> tuple
     span = times[index] - times[left]
     fraction = 0.0 if span == 0.0 else (time_s - times[left]) / span
     progress = fraction
-    if (interpolation_mode or trajectory.get("interpolation_mode")) == "kinematic":
+    modes = trajectory.get("interval_modes")
+    mode = modes[left] if modes else interpolation_mode or trajectory.get("interpolation_mode")
+    if mode == "kinematic":
         v0, v1 = trajectory["speed_mps"][left], trajectory["speed_mps"][index]
         if v0 + v1 > 1e-9:
             progress = (2 * v0 * fraction + (v1 - v0) * fraction**2) / (v0 + v1)

@@ -4,7 +4,7 @@ const { openScenario } = require("./helpers");
 
 const fixture = (name) => path.join(__dirname, "fixtures", name);
 
-test("loads aligned layers, previews a route, edits samples and retains compact map state", async ({ page }) => {
+test("loads aligned layers, appends routes, edits samples and retains compact map state", async ({ page }) => {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await openScenario(page);
@@ -12,24 +12,31 @@ test("loads aligned layers, previews a route, edits samples and retains compact 
   await expect.poll(() => page.evaluate(() => state.scenario.map.roads.length)).toBe(1);
   await page.locator("#lanelet-upload").setInputFiles(fixture("lanes.osm"));
   await expect.poll(() => page.evaluate(() => state.scenario.geodata.lanelet_count)).toBe(4);
-  await page.locator("#geographic-layers summary").first().click();
-  await expect(page.locator("#georeference-summary")).toContainText("4 lanelets");
+  await page.getByText("View", { exact: true }).click();
+  await page.getByRole("button", { name: "Lanelet2 settings", exact: true }).click();
+  await expect(page.locator("#lanelet-origin-summary")).toContainText("4 lanelets");
   await page.locator("#show-lanelet").uncheck();
   await page.locator("#show-lanelet").check();
-
-  await page.locator("#route-generator summary").click();
+  await page.getByText("View", { exact: true }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.locator("#clear-actor").click();
+  await expect.poll(() => page.evaluate(() => selectedActor().waypoints.length)).toBe(0);
+  await page.locator("#time-step").fill("0.05");
+  await page.locator("#time-step").press("Tab");
+  await page.locator("#routing-settings summary").click();
   await page.locator("#route-source").selectOption("lanelet2");
-  await page.locator("#route-points").fill("5, 0, 1000\n90, 0, 1001");
   await page.locator("#route-start-speed").fill("0");
+  await page.locator("#route-start-speed").press("Tab");
   await page.locator("#route-end-speed").fill("0");
-  const original = await page.evaluate(() => state.scenario.actors[0].waypoints.length);
-  await page.locator("#route-preview").click();
-  await expect(page.locator("#route-summary")).toContainText("1000 → 1001");
-  expect(await page.evaluate(() => state.scenario.actors[0].waypoints.length)).toBe(original);
+  await page.locator("#route-end-speed").press("Tab");
+  await page.locator("#route-mode").check();
+  await page.evaluate(() => activateCanvasPoint(5, 0));
+  await expect(page.locator("#route-summary")).toContainText("Start set");
   const layerRequests = [];
   page.on("request", (request) => { if (request.url().includes("/api/layers")) layerRequests.push(request.url()); });
-  await page.locator("#route-apply").click();
-  await expect.poll(() => page.evaluate(() => state.scenario.actors[0].trajectory_options.interpolation_mode)).toBe("kinematic");
+  await page.evaluate(() => activateCanvasPoint(90, 0));
+  await expect(page.locator("#route-summary")).toContainText("1000 → 1001");
+  await expect.poll(() => page.evaluate(() => selectedActor().trajectory_options.interpolation_sections.at(-1).mode)).toBe("kinematic");
   await expect(page.locator("#waypoint-body tr")).toHaveCount(100);
   await page.locator("#waypoints-panel .table-pager input").fill("2");
   await page.locator("#waypoints-panel .table-pager input").press("Tab");
@@ -41,24 +48,24 @@ test("loads aligned layers, previews a route, edits samples and retains compact 
   expect(errors).toEqual([]);
 });
 
-test("imagery failures leave authoring usable and stale previews cannot overwrite edits", async ({ page }) => {
+test("imagery failures leave authoring usable and failed routes retain previous points", async ({ page }) => {
   await openScenario(page);
   await page.locator("#map-upload").setInputFiles(fixture("reference.xodr"));
   await expect.poll(() => page.evaluate(() => Boolean(state.scenario.geodata.frame))).toBe(true);
   await page.route("**/api/orthophoto/**", (route) => route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ detail: "WMS timeout" }) }));
-  await page.locator("#geographic-layers summary").first().click();
+  await page.getByText("View", { exact: true }).click();
+  await page.getByRole("button", { name: "Orthophoto settings", exact: true }).click();
   await page.locator("#show-orthophoto").check();
   await expect(page.locator("#imagery-status")).toContainText("WMS timeout");
-  await page.locator("#route-generator summary").click();
-  await page.locator("#route-points").fill("5, -1.5\n90, -1.5");
-  await page.locator("#route-preview").click();
-  await expect(page.locator("#route-apply")).toBeEnabled();
+  await page.getByText("View", { exact: true }).click();
+  await page.locator("#route-mode").check();
+  const before = await page.evaluate(() => JSON.stringify(selectedActor().waypoints));
+  await page.evaluate(() => activateCanvasPoint(90, -1.5));
+  await expect(page.locator("#route-summary")).toContainText("Reference speed");
+  expect(await page.evaluate(() => JSON.stringify(selectedActor().waypoints))).toBe(before);
   await page.locator("#waypoint-1-speed_mps").fill("12");
   await page.locator("#waypoint-1-speed_mps").press("Tab");
-  await expect.poll(() => page.evaluate(() => state.scenario.actors[0].waypoints[1].speed_mps)).toBe(12);
-  await page.locator("#route-apply").click();
-  await expect(page.locator("#status")).toContainText("changed");
-  expect(await page.evaluate(() => state.scenario.actors[0].waypoints.length)).toBe(3);
+  await expect.poll(() => page.evaluate(() => selectedActor().waypoints[1].speed_mps)).toBe(12);
 });
 
 test("discards pending imagery when the working frame changes", async ({ page }) => {
@@ -67,7 +74,7 @@ test("discards pending imagery when the working frame changes", async ({ page })
   await expect.poll(() => page.evaluate(() => Boolean(state.scenario.geodata.frame))).toBe(true);
   const pending = [];
   await page.route("**/api/orthophoto/**", (route) => { pending.push(route); });
-  await page.locator("#geographic-layers summary").first().click();
+  await page.getByText("View", { exact: true }).click();
   await page.locator("#show-orthophoto").check();
   await expect.poll(() => pending.length).toBeGreaterThan(0);
   const originalRevision = await page.evaluate(() => state.scenario.geodata.revision);

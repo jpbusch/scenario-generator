@@ -1,5 +1,40 @@
 # Georeferenced scenario authoring
 
+## Integrated authoring controls
+
+| Task | Status | Acceptance |
+| --- | --- | --- |
+| Expandable layers in View → Map view | Done | Independent visibility, opacity and origins; stable controls and accessible disclosures |
+| Shared Load map dialog | Done | XODR defaults/upload and Lanelet2 upload/removal; retain both layers |
+| Click-to-append vehicle routing | Done | Current endpoint/time/speed, shared time step, ordered clicks and atomic revision checks |
+| Section interpolation and persistence | Done | Preserve previous curves; mixed manual/kinematic editing, playback and export roundtrips |
+| Middle-button delete | Done | Delete exactly one last waypoint without dragging or browser autoscroll |
+| Integrated regression and performance checks | Done | Python, Playwright, lint, wheel and large-map cache checks; results recorded below |
+
+
+### Integrated controls — results (2026-10-03)
+
+- **200 Python tests pass**, including 17 append/section regressions: unchanged manual and generated prefixes, inferred legacy speeds, exact position/time/speed consistency, in-lane start transitions, atomic failures and revision conflicts, both routing sources, bidirectional matching, section edits, config/JSON roundtrips and settings migration.
+- **30 Playwright cases pass**: the complete 29-case regression suite plus the new saved-preferences/missing-source case; the changed routing controls were additionally checked after the final availability change. Coverage includes the existing accessibility states, real file-chooser imports, persistent layer controls/focus, independent origins, consecutive pointer targets, cancellation on actor switches and middle-button deletion without confirmation/dragging.
+- Ruff, `git diff --check`, wheel build and installed-wheel smoke checks pass. Compose was restarted with the updated backend and remains available at `http://localhost:8000`; its orthophoto cache volume is retained.
+- Repeat the large-map measurement with `node tests/e2e/benchmark-large-maps.js`. It now measures two appended sections per source, checks that the first section's curve stays byte-for-byte unchanged and changes Lanelet2 opacity while observing layer requests. These changes do not modify either example map.
+
+| Warm measurement, both example maps | Integrated controls |
+| --- | ---: |
+| XODR upload + transfer + render | 3.40 s |
+| Lanelet2 upload + transfer + render | 4.01 s |
+| Compact state, HTTP | 3.2 ms / 9,477 bytes |
+| XODR preview, cold / warm | 710 / 7.8 ms |
+| Lanelet2 preview, cold / warm | 324 / 9.8 ms |
+| Append XODR section + update browser | 42.5–62.7 ms |
+| Append Lanelet2 section + update browser | 34.6–57.3 ms |
+| Waypoint edit + next browser frame | 57.1–84.4 ms |
+| Pan / zoom / playback | 57.8 / 59.7 / 60.0 FPS |
+| Layer requests during warm actor and opacity changes | 0 |
+| Browser exceptions | 0 |
+
+Same machine, Compose limits, viewport and imagery-off conditions as documented below. The updated playback trajectory contains two independently generated 0 → 30 → 0 km/h sections sampled at 0.1 s. Default UI sampling continues to use the existing Time step value; enabling Route does not change it. Main layer visibility gates annotations and origin markers, while retaining each subordinate setting. Both origins are off and Lanelet2 opacity is 1 by default; the legacy shared origin flag migrates to both independent flags.
+
 Implementation order: performance → shared map frame / Lanelet2 → NRW imagery → routing / kinematics → local deployment.
 
 | Task | Status | Acceptance |
@@ -78,6 +113,6 @@ The wheel smoke test requires its own installed environment and a free port 8000
 
 - Routing uses one source per route and supports vehicles. Existing cyclist/pedestrian/manual workflows remain available. The reference speed is explicit and does not simulate signs, signals or other actors.
 - Lane changes use a smooth 15 m transition inside the sampled driving corridor. Missing/unsupported XODR lane-change markings are handled conservatively; disconnected geometry above 2 m and insufficient transition space produce an error instead of joining unrelated roads.
-- Generated trajectories retain their source/parameters and kinematic interpolation after edits; regeneration remains an explicit preview/apply action. Manual trajectories retain smoothing.
+- Generated sections retain their source/parameters and kinematic interpolation after edits. Route mode explicitly appends new sections; it never regenerates earlier sections. The legacy preview/apply API remains available. Manual sections retain smoothing.
 - Lanelet2 remains read-only and needs the Linux x86_64 bindings, without ROS. No OSM/XODR conversion or complete simple-scenario JSON importer was added.
 - Orthophotos remain opt-in online tiles, capped at 512 MiB on disk; there is no whole-map offline downloader. Save project/export bundles before restarting because editor sessions remain temporary. Extracted bundle map dependencies are uploaded before its config, matching the existing separate-file import workflow.

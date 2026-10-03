@@ -90,33 +90,37 @@ restarting: editor sessions themselves remain temporary, as in the original app.
 
 1. Load an OpenDRIVE map as usual. Its `geoReference` and header offset establish
    the local working frame. For this checkout, try `example_maps/campus.xodr`.
-2. Open **Geographic layers** and import a Lanelet2 `.osm` map, for example
-   `example_maps/aachen.osm`. It is projected into the XODR frame; importing it
-   does not replace the XODR. Lanelet2 alone establishes a nearby local UTM frame.
-3. Toggle **NRW orthophotos**, Lanelet2 and coordinate origins independently.
-   Use the opacity sliders to compare the maps. Orthophotos load online only
-   near the map extent and visible viewport; failures leave the editor usable.
-4. Select a vehicle and open **Create vehicle route**. Choose XODR or Lanelet2,
-   pick a start and target on the canvas, and optionally add via points. Numeric
-   entries accept local X/Y or longitude/latitude, one point per line. An optional
-   third value selects a lane: `road_id:section_index:lane_id` for imported XODR,
-   `road_name:lane_id` for synthetic maps, or a Lanelet2 ID. An inverted Lanelet2
-   direction uses its negative ID when vehicle traffic rules permit it.
-5. Enter start/end/reference speeds in km/h, positive acceleration and braking
-   in m/s², a start time and sampling interval. **Preview route** displays its
-   direction, matched lanes, length, duration and lane changes. **Use route**
-   replaces only the selected actor's trajectory.
-6. Edit the generated points and speeds with the existing tools. Large tables
-   have pages of 100 rows; the canvas thins sample labels for readability.
-   Generated routes use kinematic interpolation so their constant acceleration
-   profile is retained. Manual trajectories keep their established smoothing.
+2. Open **Load map**, select **Lanelet2 (.osm)** and upload a map, for example
+   `example_maps/aachen.osm`. It is projected into the XODR frame and does not
+   replace the XODR. Lanelet2 alone establishes a nearby local UTM frame.
+3. Open **View → Map view**. XODR, Lanelet2 and Orthophoto each have a visibility
+   checkbox and a separate expansion button. Expand a layer for its opacity,
+   origins and settings. Orthophotos load online near the map and viewport;
+   failures leave the editor usable.
+4. Select a vehicle and enable **Route** in **Editing controls**. In **Routing
+   settings**, choose the map and set end/reference speeds in km/h and positive
+   acceleration/braking in m/s². The existing **Time step [s]** sets the sampling
+   interval. Start time and speed are inherited from the last waypoint.
+5. Click the next target on the canvas to append a route. More target clicks
+   extend it in order; no preview/apply step is required. For an empty trajectory,
+   the first click sets the start using the configured start time/speed. Select
+   an explicit start lane/direction when overlapping directions are ambiguous.
+   End speed 0 means stopping at each clicked target. The reference speed must
+   be at least the inherited start speed and configured end speed.
+6. Edit generated points and speeds with the existing tools. Middle-click the
+   canvas to delete exactly the last waypoint; right-drag still pans the view.
+   Large tables have pages of 100 rows. Existing manual sections retain their
+   smoothing when a route is appended; generated sections retain their
+   kinematic motion. Uncheck Route to resume manually placing points.
 
 Routing observes lane direction, vehicle accessibility, topology and lane-change
 permissions. Lane changes need a continuous driving corridor and at least 15 m
 of usable parallel lane length. The speed profile follows the explicitly entered
 reference speed; it does not simulate traffic lights, interactions or speed-limit
 compliance. Short routes reduce the reachable peak speed; impossible endpoint
-speeds produce an error. Editing does not regenerate a route automatically.
+speeds produce an error. An off-centre start needs a 15 m transition inside its
+driving lane; points outside the lane must be moved first. Editing does not
+regenerate a route automatically.
 
 For an XODR without a geographic reference, enter a projected metric CRS, origin
 and rotation under **Set map georeference** before using geographic overlays.

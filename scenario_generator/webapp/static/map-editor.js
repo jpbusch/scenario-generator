@@ -4,7 +4,6 @@
 const viewOptionGroups = [
   ["Table view", [["show_waypoint_table", "Trajectory points table"], ["show_road_waypoint_table", "Road waypoints table"], ["show_road_relations_table", "Road relations table"], ["show_detection_gaps", "Perception gaps"], ["show_speed_profile", "Velocity profile"]]],
   ["Road user view", [["show_vehicles", "Vehicles"], ["show_bounding_boxes", "Bounding boxes"], ["show_trajectory_waypoints", "Trajectory waypoints"], ["show_point_indices", "Point indices"], ["show_waypoint_times", "Waypoint times"], ["show_speed_labels", "Speed labels"], ["show_segment_average_speeds", "Segment average speeds"], ["show_actor_names", "Actor names"], ["show_min_ttc", "TTC min"], ["show_min_thw", "THW min"]]],
-  ["Map view", [["show_map", "XODR map"], ["show_road_connections", "Road connections"], ["show_road_points", "Road points"], ["show_lane_numbers", "Lane numbers"], ["show_road_centerlines", "Road centerlines"], ["show_map_helpers", "Map helper lines"]]],
 ];
 
 /** Keep the View popover beside its trigger without crossing viewport edges. */
@@ -34,7 +33,7 @@ window.addEventListener("resize", positionViewOptions);
 /** Report whether a details element is one of the dismissible toolbar popovers. */
 function isDismissibleMenu(details) {
   return Boolean(details)
-    && (details.classList.contains("help-options") || Boolean(details.closest(".canvas-toolbar")));
+    && (details.classList.contains("help-options") || details.parentElement?.classList.contains("canvas-toolbar"));
 }
 
 document.addEventListener("click", (event) => {
@@ -47,7 +46,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   const eligibleMenus = [...document.querySelectorAll("details[open]")].filter(isDismissibleMenu);
   if (!eligibleMenus.length) return;
-  const focusedMenu = document.activeElement?.closest?.("details[open]");
+  const focusedMenu = eligibleMenus.find((menu) => menu.contains(document.activeElement));
   const closingFocusedMenu = eligibleMenus.includes(focusedMenu);
   eligibleMenus.forEach((menu) => { menu.open = false; });
   // Focus only returns to a summary the user was actually inside, and only that
@@ -65,7 +64,7 @@ function renderMode() {
   // Keep unavailable View options visible but disabled so mode restrictions are explicit.
   const mapMode = state.scenario.settings.map_mode;
   if (mapMode && state.measurementTool !== null) clearMeasurement();
-  if (mapMode) document.querySelectorAll(".canvas-toolbar details[open]").forEach((menu) => menu.removeAttribute("open"));
+  if (mapMode && !state.previousMapMode) document.querySelectorAll(".canvas-toolbar > details[open]").forEach((menu) => menu.removeAttribute("open"));
   $("#mode-toggle").textContent = mapMode ? "Switch to trajectory mode" : "Switch to map mode";
   $("#primary-title").textContent = mapMode ? "Roads" : "Actors";
   if (mapMode) $("#inspector-title").textContent = "Road inspector";
@@ -105,30 +104,44 @@ function renderMode() {
   if (visibleTabs.length && !visibleTabs.includes(activeTab)) showTableTab(visibleTabs[0]);
   state.previousMapMode = mapMode;
   const options = $("#view-options");
-  options.replaceChildren();
   viewOptionGroups.forEach(([title, entries]) => {
-    const group = document.createElement("section");
-    group.className = "view-option-group";
-    const heading = document.createElement("h3"); heading.textContent = title; group.append(heading);
+    let group = options.querySelector(`[data-view-group="${title}"]`);
+    if (!group) {
+      group = document.createElement("section"); group.dataset.viewGroup = title;
+      group.className = "view-option-group";
+      const heading = document.createElement("h3"); heading.textContent = title; group.append(heading);
+      options.insertBefore(group, $("#map-view-options"));
+    }
     entries.forEach(([key, label]) => {
-      const entry = document.createElement("label");
-      entry.className = "check-label";
-      const input = document.createElement("input");
-      input.id = `view-${key}`;
-      input.type = "checkbox"; input.checked = state.scenario.settings[key];
+      let input = $(`#view-${key}`);
+      if (!input) {
+        input = document.createElement("input"); input.id = `view-${key}`; input.type = "checkbox";
+        const entry = document.createElement("label"); entry.className = "check-label";
+        const text = document.createElement("span"); text.textContent = label;
+        entry.append(input, text); group.append(entry);
+        input.onchange = () => updateSettings({ [key]: input.checked }, input);
+      }
+      const entry = input.closest("label");
+      input.checked = state.scenario.settings[key];
       input.disabled = mapMode
         ? ["show_detection_gaps", "show_speed_profile", "show_min_ttc", "show_min_thw", "show_waypoint_table"].includes(key)
         : ["show_road_waypoint_table", "show_road_relations_table"].includes(key);
       entry.classList.toggle("unavailable", input.disabled);
-      if (input.disabled) entry.title = "Unavailable in current mode";
-      input.onchange = () => updateSettings({ [key]: input.checked }, input);
-      const text = document.createElement("span");
-      text.textContent = label;
-      entry.append(input, text); group.append(entry);
+      entry.title = input.disabled ? "Unavailable in current mode" : "";
     });
-    options.append(group);
   });
+  for (const input of $("#xodr-view-options").querySelectorAll("input[id^=view-]")) input.checked = state.scenario.settings[input.id.slice(5)];
+  $("#view-show_map").checked = state.scenario.settings.show_map;
 }
+
+for (const input of $("#map-view-options").querySelectorAll("input[id^=view-]")) input.onchange = () => updateSettings({ [input.id.slice(5)]: input.checked }, input);
+for (const button of document.querySelectorAll(".layer-disclosure")) button.onclick = () => {
+  const content = document.getElementById(button.getAttribute("aria-controls"));
+  content.hidden = !content.hidden;
+  button.setAttribute("aria-expanded", String(!content.hidden));
+  button.textContent = content.hidden ? "▸" : "▾";
+  positionViewOptions();
+};
 
 /** Build the selectable reference-road list; derived helper roads stay hidden. */
 function renderMapEditor() {
@@ -420,6 +433,7 @@ $("#show-adjustment-warnings").onchange = () => updateSettings({ adjustment_warn
 $("#clear-actor").onclick = async () => {
   const actor = selectedActor();
   if (!actor || !confirm(`Clear all trajectory points for ${actor.name}?`)) return;
+  cancelRouteQueue();
   try {
     state.scenario = await api(`/api/actors/${actor.name}`, {
       method: "PATCH",
@@ -433,7 +447,7 @@ $("#clear-actor").onclick = async () => {
     setStatus(error.message);
   }
 };
-$("#delete-last-point").onclick = () => { const actor = selectedActor(); if (actor?.waypoints.length) deleteWaypoint(actor.waypoints.length - 1); };
+$("#delete-last-point").onclick = deleteLastWaypoint;
 $("#clear-road-links").onclick = async () => {
   const index = selectedRoadIndex();
   if (index === undefined || !confirm("Clear all links of the selected road?")) return;

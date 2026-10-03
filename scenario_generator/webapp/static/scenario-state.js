@@ -12,13 +12,13 @@ const tooltipSpecs = [
     ? "Add an empty road to the map, then select canvas positions or use the Road waypoints table to define its reference line."
     : "Add another road user to the scenario. Configure its type, dimensions, action, parameters, and controller in the Actor inspector."],
   ["#mode-toggle", "Switch editing context. Entering Map mode alone does not create a map; select a canvas position or use Add road to start one."],
-  ["#time-step", "Used only by 'New points: fixed time step': each clicked point is initially placed this many seconds after the previous point."],
+  ["#time-step", "Time between samples in Route mode. For manual points with a fixed time step, the next clicked point is placed this many seconds after the previous one."],
   ["#trajectory-direction", "Applies when you edit an existing point's time, speed, or position. Forward keeps earlier points fixed and recalculates later ones; backward keeps later points fixed and recalculates earlier ones. It does not change the direction in which newly clicked points are appended."],
   ["#waypoint-timing", "Controls only the timestamp assigned to the next clicked trajectory point. Fixed time step uses the value above. Preserve speed derives the time from the previous segment's average speed, so the difference is visible when successive segment lengths differ."],
   ["#lane-snap", "For a loaded map, snap new or moved trajectory points to the centreline of a compatible lane. It may also use that lane's speed limit."],
   ["#delete-last-point", "Remove the most recently added trajectory point for the selected actor."],
   ["#clear-actor", "Remove every trajectory point for the selected actor. The actor itself remains available."],
-  ["#map-canvas", "Pointer: select empty space to append a point, drag a point to move it, use the wheel to zoom, and right/middle drag to pan. Keyboard: use arrows for the cursor, Enter to select, plus/minus to zoom, and Alt plus arrows to pan. Exact point values are also available in the tables."],
+  ["#map-canvas", "Pointer: select empty space to append a point or route, drag a point to move it, use the wheel to zoom, right drag to pan, and middle click to delete the last trajectory point. Keyboard: use arrows for the cursor, Enter to select, plus/minus to zoom, and Alt plus arrows to pan. Exact point values are also available in the tables."],
   ["#fit-view", "Reset the viewport so all currently visible roads and trajectories fit on the canvas."],
   ["#connect-roads", "Connect two lanes by selecting a source lane and then a target lane on the canvas with a pointer or the keyboard cursor."],
   ["#delete-last-road-point", "Remove the final reference-line point from the selected road."],
@@ -95,9 +95,18 @@ async function api(path, options = {}, parseJson = true) {
   }
   // Serialize mutations so an older browser request cannot overwrite a newer one.
   const request = async () => {
+    const { prepare, ...requestOptions } = options;
+    let actionPath = path;
+    if (prepare) {
+      const prepared = prepare();
+      if (!prepared) return null;
+      const { path: preparedPath, ...preparedOptions } = prepared;
+      actionPath = preparedPath || path;
+      Object.assign(requestOptions, preparedOptions);
+    }
     const compact = path === "/api/scenario" || method !== "GET";
-    const requestPath = compact ? `${path}${path.includes("?") ? "&" : "?"}compact=true` : path;
-    const response = await fetch(requestPath, options);
+    const requestPath = compact ? `${actionPath}${actionPath.includes("?") ? "&" : "?"}compact=true` : actionPath;
+    const response = await fetch(requestPath, requestOptions);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || response.statusText);
@@ -576,6 +585,20 @@ async function deleteWaypoint(index) {
   } catch (error) {
     setStatus(error.message);
   }
+}
+
+/** Delete the current endpoint when this operation reaches the mutation queue. */
+async function deleteLastWaypoint() {
+  const actorName = selectedActor()?.name;
+  if (!actorName || !selectedActor().waypoints.length) return;
+  try {
+    const result = await api(`/api/actors/${actorName}/waypoints/0`, { method: "DELETE", prepare: () => {
+      const actor = state.scenario.actors.find((actor) => actor.name === actorName);
+      if (!actor?.waypoints.length) return null;
+      return { path: `/api/actors/${encodeURIComponent(actorName)}/waypoints/${actor.waypoints.length - 1}` };
+    } });
+    if (result) { await refresh(); setStatus("Last trajectory point deleted"); }
+  } catch (error) { setStatus(error.message); }
 }
 
 /** Prefer sampled curve distances and fall back to straight control-point segments. */

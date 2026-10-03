@@ -1,13 +1,18 @@
 # Quick workflow
 
 1. Open **Load scenario** or **Load map** and choose a bundled default or load a
-   custom file. A map is optional when actors do not need a road network.
+   custom file. Load map offers OpenDRIVE and Lanelet2 separately; both can
+   remain loaded. A map is optional when actors do not need a road network.
    Loading a complete scenario configuration replaces the current actors,
    scenario information, and map. If that configuration has no map reference,
    the previous map is removed intentionally. A trajectory-only JSON contains
    actor trajectories rather than the complete editable project state.
 2. Select an actor in the **Actors** panel and edit its static information, action, and controller.
 3. Create or change trajectory points on the canvas or in the Trajectory points table.
+   For vehicles, enable **Route** in Editing controls to append a routed segment
+   from the last point with each target click. **Routing settings** configures its
+   map and speed profile; **Time step [s]** controls the sampling interval.
+   With an empty trajectory the first click sets the start.
 4. Use the **Export controls** and **Additional scenario information** panels for metadata, environmental information, quality checks, and exports.
 
 # Canvas interaction
@@ -17,6 +22,7 @@
   to select the current position. Hold Shift for five-metre cursor steps.
 - Drag a trajectory or road point to move it, or enter its exact coordinates in
   the corresponding points table.
+- Middle-click the canvas to delete one last trajectory waypoint. Right-drag pans.
 - Use the mouse wheel or the canvas `+` and `-` keyboard commands to zoom. Use
   Alt plus an arrow key to pan. **Fit view** or the `F` key resets the viewport.
 - Actor names, point times, and speeds can be edited in their labelled form and
@@ -27,6 +33,8 @@
 # Views and tables
 
 - Use View to control tables, actor annotations, map overlays, perception gaps, and the velocity profile.
+- Under **View → Map view**, XODR, Lanelet2 and Orthophoto have independent
+  checkboxes and expansion buttons for opacity, origins and layer settings.
 - Options unavailable in the current editing mode are disabled.
 - The velocity profile and perception gaps are available only in trajectory mode.
 

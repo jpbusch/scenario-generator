@@ -62,6 +62,7 @@ from scenario_generator.scenario_elements.road_user.road_user import (
 from scenario_generator.scenario_elements.road_user.trajectory import Trajectory, Waypoint
 
 from scenario_generator.webapp.geodata import GeoWorkspace
+from scenario_generator.webapp.trajectory_sections import append_section, remap_sections, validate_options
 from scenario_generator.map.georeference import MapFrame, read_xodr_frame
 from scenario_generator.map.orthophoto import OrthophotoCache
 from scenario_generator.map.georeference import write_referenced_xodr
@@ -282,9 +283,12 @@ class WebScenario:
             "show_map": True,
             "show_lanelet": True,
             "show_origins": False,
+            "show_xodr_origin": False,
+            "show_lanelet_origin": False,
             "show_orthophoto": False,
             "orthophoto_opacity": 1.0,
             "map_opacity": 0.65,
+            "lanelet_opacity": 1.0,
             "show_road_connections": False,
             "show_road_points": False,
             "show_lane_numbers": False,
@@ -594,6 +598,7 @@ class WebScenario:
             for value in values
         ]
         self.vehicles[name] = sorted(waypoints, key=lambda item: item.time_s)
+        self.geo.actor_options.get(name, {}).pop("interpolation_sections", None)
 
     def next_waypoint_time(self, name: str, x_m: float, y_m: float) -> float:
         """Calculate the next timestamp with the configured timing mode."""
@@ -661,7 +666,11 @@ class WebScenario:
         # accept the point at the nearest valid boundary instead of rejecting
         # an otherwise intentional canvas or keyboard edit.
         speed = max(speed, 0.0)
+        old_count = len(waypoints)
         waypoints.append(Waypoint(next_time, x_m, y_m, speed_mps=speed))
+        options = self.geo.actor_options.get(name, {})
+        if options.get("interpolation_sections") or options.get("interpolation_mode") == "kinematic":
+            append_section(options, old_count, len(waypoints), "smooth")
 
     @staticmethod
     def waypoint_snapshot(
@@ -871,11 +880,14 @@ class WebScenario:
                 (float(previous.speed_mps or 0.0) + float(following.speed_mps or 0.0)) / 2.0,
             )
         snapshot = self.waypoint_snapshot(waypoints)
+        options_snapshot = deepcopy(self.geo.actor_options.get(name, {}))
         try:
+            remap_sections(self.geo.actor_options.get(name, {}), len(waypoints), insert_index)
             waypoints.insert(insert_index, point)
             self.recalculate_times_from_speeds(name, insert_index)
         except (IndexError, TypeError, ValueError):
             self.restore_waypoints(name, snapshot)
+            self.geo.actor_options[name] = options_snapshot
             raise
 
     def delete_waypoint(self, name: str, point_index: int) -> None:
@@ -884,7 +896,9 @@ class WebScenario:
         if not 0 <= point_index < len(waypoints):
             raise ValueError("Unknown trajectory point.")
         snapshot = self.waypoint_snapshot(waypoints)
+        options_snapshot = deepcopy(self.geo.actor_options.get(name, {}))
         try:
+            remap_sections(self.geo.actor_options.get(name, {}), len(waypoints), point_index, deleting=True)
             del waypoints[point_index]
             if len(waypoints) == 1:
                 waypoints[0].speed_mps = 0.0
@@ -894,6 +908,7 @@ class WebScenario:
                 )
         except (IndexError, TypeError, ValueError):
             self.restore_waypoints(name, snapshot)
+            self.geo.actor_options[name] = options_snapshot
             raise
 
     def set_segment_speed(self, name: str, segment_index: int, speed_mps: float) -> None:
@@ -940,6 +955,10 @@ class WebScenario:
                 else self.actor_trajectory(name, waypoints).as_moving_series()
             )
             trajectory["interpolation_mode"] = self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth")
+            options = self.geo.actor_options.get(name, {})
+            if options.get("interpolation_sections") or options.get("routing_settings"):
+                trajectory["control_waypoints"] = [dict(point.__dict__) for point in waypoints]
+                trajectory["trajectory_options"] = deepcopy(options)
             trajectory["actor_type"] = dimensions.actor_type
             trajectory["detected"] = [
                 not any(gap.vehicle_name == name and gap.contains(time_s) for gap in self.detection_gaps)
@@ -1091,7 +1110,8 @@ class WebScenario:
 
     def actor_trajectory(self, name, waypoints):
         return Trajectory(waypoints=waypoints, parked_yaw_rad=self.dimensions.get(name, VehicleDimensions()).parked_yaw_rad,
-                          interpolation_mode=self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth"))
+                          interpolation_mode=self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth"),
+                          interpolation_sections=self.geo.actor_options.get(name, {}).get("interpolation_sections", []))
 
     def map_snapshot(self):
         key = (self.geo.revision, id(self.map.roads), id(self.map.view_roads), self.map.edit_enabled)
@@ -1132,7 +1152,7 @@ class WebScenario:
         dimensions = self.dimensions[name]
         signature = (tuple((p.time_s, p.x_m, p.y_m, p.speed_mps) for p in waypoints),
                      tuple(dimensions.as_dict().items()), dimensions.parked_yaw_rad,
-                     self.geo.actor_options.get(name, {}).get("interpolation_mode", "smooth"))
+                     json.dumps(self.geo.actor_options.get(name, {}), sort_keys=True))
         cached = self._actor_cache.get(name)
         if cached and cached[0] == signature:
             return cached[1]
@@ -1149,6 +1169,7 @@ class WebScenario:
             "curve": curve,
             "dimensions": dimensions.as_dict(),
             "trajectory_options": self.geo.actor_options.get(name, {}),
+            "revision": self.geo.actor_revision(self, name),
         }
         self._actor_cache[name] = (signature, result)
         return result
@@ -2009,6 +2030,12 @@ def update_actor(name: str, payload: dict[str, Any]) -> dict[str, object]:
         if mode not in {"smooth", "kinematic"}:
             raise HTTPException(status_code=400, detail="Unknown trajectory interpolation mode")
         scenario.geo.actor_options.setdefault(name, {})["interpolation_mode"] = mode
+        scenario.geo.actor_options[name].pop("interpolation_sections", None)
+    if "routing_settings" in payload:
+        try:
+            scenario.geo.actor_options.setdefault(name, {})["routing_settings"] = scenario.geo.routing_settings(payload["routing_settings"])
+        except IMPORT_DATA_ERRORS as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "waypoints" in payload:
         scenario.replace_waypoints(name, payload["waypoints"])
         snap_index = payload.get("snap_waypoint_index")
@@ -2148,7 +2175,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, object]:
             raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
         if key == "time_step_s":
             scenario.settings[key] = max(float(value), 0.001)
-        elif key in {"orthophoto_opacity", "map_opacity"}:
+        elif key in {"orthophoto_opacity", "map_opacity", "lanelet_opacity"}:
             value = float(value)
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise HTTPException(status_code=400, detail="Opacity must be between 0 and 1")
@@ -2157,6 +2184,10 @@ def update_settings(payload: dict[str, Any]) -> dict[str, object]:
             scenario.settings[key] = str(value)
         else:
             scenario.settings[key] = bool(value)
+    if "show_origins" in payload:
+        for key in ("show_xodr_origin", "show_lanelet_origin"):
+            if key not in payload:
+                scenario.settings[key] = bool(payload["show_origins"])
     if scenario.settings["map_mode"]:
         scenario.settings["show_speed_profile"] = False
     return scenario.snapshot()
@@ -2690,7 +2721,22 @@ async def import_config(file: UploadFile = File(...)) -> dict[str, object]:
                         mode = entry.get("interpolation_mode", "smooth")
                         if mode not in {"smooth", "kinematic"}:
                             raise ValueError("Unknown trajectory interpolation mode.")
-                        candidate.geo.actor_options[actor_name] = {"interpolation_mode": mode}
+                        options = deepcopy(entry.get("trajectory_options", {"interpolation_mode": mode}))
+                        intervals = entry.get("interval_modes")
+                        if intervals and "control_waypoints" not in entry:
+                            if not isinstance(intervals, list) or len(intervals) != len(imported_vehicles[actor_name]) - 1:
+                                raise ValueError("Interpolation intervals must match the imported samples.")
+                            sections = []
+                            for index, interval_mode in enumerate(intervals):
+                                if interval_mode not in {"smooth", "kinematic"}:
+                                    raise ValueError("Unknown interpolation interval mode.")
+                                if sections and sections[-1]["mode"] == interval_mode:
+                                    sections[-1]["last_index"] = index + 1
+                                else:
+                                    sections.append({"first_index": index, "last_index": index + 1, "mode": interval_mode})
+                            options["interpolation_sections"] = sections
+                        validate_options(options, imported_vehicles[actor_name])
+                        candidate.geo.actor_options[actor_name] = options
                 pending_workspace = candidate
 
         if imported_vehicles is not None:
@@ -3047,6 +3093,44 @@ def preview_actor_route(name: str, payload: dict[str, Any]):
         return scenario.geo.preview(scenario.current(), name, payload)
     except IMPORT_DATA_ERRORS as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/actors/{name}/route/lanes")
+def actor_route_lanes(name: str, source: str = "xodr"):
+    """Offer explicit directions for overlapping or bidirectional start lanes."""
+    if name not in scenario.vehicles:
+        raise HTTPException(status_code=404, detail="Actor not found")
+    scenario.geo.sync_map(scenario.current())
+    points = scenario.vehicles[name]
+    if not points:
+        return {"lanes": [], "map_revision": scenario.geo.revision}
+    try:
+        lanes = scenario.geo.graph(scenario.current(), source).candidates(points[-1].__dict__)
+        return {"lanes": lanes, "map_revision": scenario.geo.revision}
+    except IMPORT_DATA_ERRORS as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/actors/{name}/route/append")
+def append_actor_route(name: str, payload: dict[str, Any]):
+    if name not in scenario.vehicles:
+        raise HTTPException(status_code=404, detail="Actor not found")
+    current = scenario.current()
+    current.geo.sync_map(current)
+    revision = current.geo.actor_revision(current, name)
+    map_revision = current.geo.revision
+    if payload.get("actor_revision") != revision or payload.get("map_revision") != map_revision:
+        raise HTTPException(status_code=409, detail="Map or actor changed; select the route target again.")
+    try:
+        points, options, result = current.geo.append(current, name, payload)
+    except IMPORT_DATA_ERRORS as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if current.geo.revision != map_revision or current.geo.actor_revision(current, name) != revision:
+        raise HTTPException(status_code=409, detail="Map or actor changed during routing; select the target again.")
+    current.vehicles[name] = points
+    current.geo.actor_options[name] = options
+    current.geo.previews.pop(name, None)
+    return {"scenario": current.snapshot(), "route": result}
 
 
 @app.post("/api/actors/{name}/route/apply")

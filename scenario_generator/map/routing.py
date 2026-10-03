@@ -73,6 +73,56 @@ class LaneGraph:
             raise ValueError("Route points must be within 20 metres of a driving lane.")
         return key, line.project(p)
 
+    def candidates(self, value, inside=True):
+        """Return directed vehicle lanes containing a start point, with their heading."""
+        p = Point(finite_number(value["x_m"], "Route X"), finite_number(value["y_m"], "Route Y"))
+        self.match(value)  # Warm the same spatial index used for routing.
+        candidates = []
+        for index in self.index.query(p.buffer(20)) if self.index is not None else range(len(self.lanes)):
+            key = self.keys[int(index)] if self.index is not None else list(self.lanes)[index]
+            line = self.lanes[key]
+            if line.distance(p) > 20 or (inside and not self.corridors[key].buffer(1e-6).covers(p)):
+                continue
+            s = line.project(p)
+            before, after = line.interpolate(max(0, s - 0.2)), line.interpolate(min(line.length, s + 0.2))
+            candidates.append({"lane_id": key, "heading_rad": math.atan2(after.y - before.y, after.x - before.x),
+                               "distance_m": line.distance(p), "x_m": line.interpolate(s).x, "y_m": line.interpolate(s).y})
+        return sorted(candidates, key=lambda item: (item["distance_m"], item["lane_id"]))
+
+    def align_start(self, points, start, lane_id, start_heading=None):
+        """Join an unchanged in-lane endpoint to the centreline over fifteen metres."""
+        position = Point(start["x_m"], start["y_m"])
+        corridor = self.corridors[lane_id]
+        if not corridor.buffer(1e-6).covers(position):
+            raise ValueError("The last waypoint is outside the selected driving lane. Move it into the lane before routing.")
+        offset = (position.x - points[0][0], position.y - points[0][1])
+        if math.hypot(*offset) < 1e-6:
+            return [(position.x, position.y)] + points[1:]
+        line = LineString(points)
+        source_line = self.lanes[lane_id]
+        source_s = source_line.project(position)
+        if line.length < 15 or source_line.length - source_s < 15:
+            raise ValueError("A 15 metre in-lane transition is needed from the last waypoint to the centreline.")
+        ahead = line.interpolate(0.1)
+        tangent = math.atan2(ahead.y - points[0][1], ahead.x - points[0][0])
+        derivative = (0, 0) if start_heading is None else (
+            math.cos(start_heading) - math.cos(tangent), math.sin(start_heading) - math.sin(tangent))
+        transition = []
+        for step in range(31):
+            u = step / 30
+            blend = u**3 * (10 + u * (-15 + 6 * u))
+            # Quintic Hermite basis: retain initial lateral position and tangent;
+            # position, tangent and curvature vanish at the centreline join.
+            tangent_blend = u - 6 * u**3 + 8 * u**4 - 3 * u**5
+            p = line.interpolate(u * 15)
+            transition.append((p.x + (1 - blend) * offset[0] + 15 * tangent_blend * derivative[0],
+                               p.y + (1 - blend) * offset[1] + 15 * tangent_blend * derivative[1]))
+        if not corridor.buffer(1e-6).covers(LineString(transition)):
+            raise ValueError("The start transition leaves the driving lane; adjust the last waypoint or choose another direction.")
+        transition[0] = (position.x, position.y)
+        remainder = substring(line, 15, line.length)
+        return transition + (list(remainder.coords)[1:] if remainder.geom_type == "LineString" else [])
+
     def transition(self, source, target, progress, target_limit):
         line, other = self.lanes[source], self.lanes[target]
         for lo, hi in self.change_intervals[source, target]:

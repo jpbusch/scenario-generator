@@ -46,7 +46,7 @@ async function main() {
         for (let i = 0; i < 2; i += 1) {
           const start = performance.now();
           const preview = await api("/api/actors/vehicle_1/route/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source, points, parameters: { start_speed_mps: 0, end_speed_mps: 0 } }) });
-          result[source].push({ ms: performance.now() - start, length_m: preview.length_m, duration_s: preview.duration_s });
+          result[source].push({ ms: performance.now() - start, length_m: preview.length_m, duration_s: preview.duration_s, midpoint: preview.points[Math.floor(preview.points.length / 2)] });
           if (source === "lanelet2" && i === 1) {
             await api("/api/actors/vehicle_1/route/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preview) });
             await refresh();
@@ -55,6 +55,32 @@ async function main() {
       }
       return result;
     }, choices);
+    if (!baseline) results.append_routes = await page.evaluate(async ({ choices, midpoints }) => {
+      const result = {};
+      for (const [source, points] of Object.entries(choices)) {
+        await api("/api/actors/vehicle_1", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ waypoints: [] }) });
+        const seed = { source, lane_id: points[0].lane_id, target: points[0],
+          parameters: { start_speed_mps: 0, end_speed_mps: 0, dt_s: 0.1 } };
+        await api("/api/actors/vehicle_1/route/append", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, map_revision: state.scenario.geodata.revision, actor_revision: state.scenario.actors[0].revision }) });
+        const targets = [{ x_m: midpoints[source][0], y_m: midpoints[source][1], lane_id: points[0].lane_id }, points[1]];
+        result[source] = [];
+        let before;
+        for (const target of targets) {
+          const start = performance.now();
+          const response = await api("/api/actors/vehicle_1/route/append", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...seed, target, map_revision: state.scenario.geodata.revision, actor_revision: state.scenario.actors[0].revision }) });
+          await refresh();
+          result[source].push({ ms: performance.now() - start, length_m: response.route.length_m, duration_s: response.route.duration_s });
+          const after = state.scenario.actors[0].curve;
+          if (before && ["time_s", "x_m", "y_m", "speed_mps", "yaw_rad"].some((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key].slice(0, before[key].length)))) throw new Error("Appending changed the previous route curve");
+          before = JSON.parse(JSON.stringify(after));
+        }
+      }
+      await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lanelet_opacity: 0.6 }) });
+      await refresh();
+      await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lanelet_opacity: 1 }) });
+      await refresh();
+      return result;
+    }, { choices, midpoints: Object.fromEntries(Object.entries(results.routes).map(([source, values]) => [source, values[1].midpoint])) });
     results.actor_edit_ms = await page.evaluate(async () => {
       const times = [];
       for (let i = 0; i < 5; i += 1) {

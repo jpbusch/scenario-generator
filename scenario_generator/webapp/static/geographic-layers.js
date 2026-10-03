@@ -1,22 +1,33 @@
-// Georeferenced layers, asynchronous imagery and explicit route generation.
+// Geographic layers and vehicle routing share the existing View and editing controls.
 
 const routeFields = {
   start_time_s: ["start-time", 1], start_speed_mps: ["start-speed", 3.6],
   end_speed_mps: ["end-speed", 3.6], reference_speed_mps: ["reference-speed", 3.6],
-  acceleration_mps2: ["acceleration", 1], deceleration_mps2: ["deceleration", 1], dt_s: ["dt", 1],
+  acceleration_mps2: ["acceleration", 1], deceleration_mps2: ["deceleration", 1],
 };
+
+function cancelRouteQueue() { state.routeEpoch = (state.routeEpoch || 0) + 1; }
 
 function renderGeodata() {
   const geo = state.scenario.geodata, settings = state.scenario.settings;
-  for (const key of ["show_lanelet", "show_origins", "show_orthophoto"]) $("#" + key.replaceAll("_", "-")).checked = settings[key];
-  $("#orthophoto-opacity").value = settings.orthophoto_opacity;
-  $("#map-opacity").value = settings.map_opacity;
+  for (const key of ["show_lanelet", "show_xodr_origin", "show_lanelet_origin", "show_orthophoto"])
+    $("#" + key.replaceAll("_", "-")).checked = settings[key];
+  for (const key of ["orthophoto_opacity", "map_opacity", "lanelet_opacity"])
+    $("#" + key.replaceAll("_", "-")).value = settings[key];
   $("#lanelet-remove").disabled = !geo.lanelet_path;
+  $("#show-lanelet").disabled = !geo.lanelet_path;
+  $("#show-lanelet-origin").disabled = !geo.lanelet_path;
+  $("#show-xodr-origin").disabled = !state.scenario.map.roads.length;
   $("#show-orthophoto").disabled = !geo.frame;
+  $("#show-orthophoto").title = geo.frame ? "" : "Set a map georeference to load orthophotos";
   $("#georeference-summary").textContent = geo.warning || (geo.frame
-    ? `${geo.frame.crs}; origin ${geo.frame.origin_lat.toFixed(7)}, ${geo.frame.origin_lon.toFixed(7)}; ${geo.lanelet_count} lanelets. Lanelet2 uses a projection origin near its first node.`
-    : "Local map without geographic reference.");
-  if (state.frameRevision !== geo.revision) {
+    ? `${geo.frame.crs}; working origin ${geo.frame.origin_lat.toFixed(7)}, ${geo.frame.origin_lon.toFixed(7)}; local XODR origin X=0, Y=0.`
+    : "Local map without geographic reference; XODR origin X=0, Y=0.");
+  $("#lanelet-origin-summary").textContent = geo.lanelet_origin
+    ? `${geo.lanelet_count} lanelets. Projection origin near the first node: ${geo.lanelet_origin.lat.toFixed(7)}, ${geo.lanelet_origin.lon.toFixed(7)}. This is the origin used for import, not a stored OSM origin.`
+    : "Load a Lanelet2 map using Load map.";
+  const frameChanged = state.frameRevision !== geo.revision;
+  if (frameChanged) {
     state.frameRevision = geo.revision;
     $("#frame-crs").value = geo.frame?.crs || "";
     for (const key of ["x", "y", "heading"]) $("#frame-" + key).value = geo.frame?.[key] || 0;
@@ -28,31 +39,57 @@ function renderGeodata() {
       state.laneletBounds ||= [x, y, x, y];
       const b = state.laneletBounds; b[0] = Math.min(b[0], x); b[1] = Math.min(b[1], y); b[2] = Math.max(b[2], x); b[3] = Math.max(b[3], y);
     }
-    if (!$("#route-points").value.trim()) $("#route-source").value = geo.lanelet_path ? "lanelet2" : "xodr";
-    clearRoutePreview();
   }
-  const actor = selectedActor();
-  $("#route-generator").hidden = settings.map_mode || !actor || actor.dimensions.actor_type !== "vehicle";
+  const actor = selectedActor(), vehicle = actor?.dimensions.actor_type === "vehicle";
+  if (frameChanged && !actor?.trajectory_options?.routing_settings && !actor?.trajectory_options?.generation)
+    $("#route-source").value = geo.lanelet_path ? "lanelet2" : "xodr";
+  const context = `${actor?.name}|${geo.revision}|${settings.map_mode}`;
+  if (state.routeContext !== context) { state.routeContext = context; cancelRouteQueue(); }
+  $("#route-controls").hidden = settings.map_mode || !vehicle;
   $("#route-source option[value=lanelet2]").disabled = !geo.lanelet_path;
   $("#route-source option[value=xodr]").disabled = !state.scenario.map.roads.length;
-  if (state.routeActor !== actor?.name) {
+  const routeSettingsKey = JSON.stringify(actor?.trajectory_options?.routing_settings || actor?.trajectory_options?.generation?.parameters || {});
+  if (state.routeActor !== actor?.name || state.routeSettingsKey !== routeSettingsKey) {
     state.routeActor = actor?.name;
-    const generation = actor?.trajectory_options?.generation;
-    $("#route-source").value = generation?.source || (geo.lanelet_path ? "lanelet2" : "xodr");
-    $("#route-points").value = generation ? generation.points.map((point) => `${point.x_m}, ${point.y_m}${point.lane_id ? ", " + point.lane_id : ""}`).join("\n") : "";
-    for (const [key, [id, divisor]] of Object.entries(routeFields)) $("#route-" + id).value = generation?.parameters?.[key] !== undefined
-      ? generation.parameters[key] * divisor : key === "start_time_s" ? 0 : key === "dt_s" ? 0.1 : divisor === 3.6 ? 30 : 2;
-    clearRoutePreview();
+    state.routeSettingsKey = routeSettingsKey;
+    const saved = actor?.trajectory_options?.routing_settings || actor?.trajectory_options?.generation?.parameters || {};
+    $("#route-source").value = saved.source || actor?.trajectory_options?.generation?.source || (geo.lanelet_path ? "lanelet2" : "xodr");
+    for (const [key, [id, divisor]] of Object.entries(routeFields)) {
+      const field = $("#route-" + id);
+      if (field !== document.activeElement) field.value = saved[key] !== undefined ? saved[key] * divisor : key === "start_time_s" ? 0 : divisor === 3.6 ? 30 : 2;
+    }
+    state.routeHasPoint = false;
+    $("#route-summary").textContent = "";
   }
+  const last = actor?.waypoints.at(-1);
+  for (const id of ["start-time", "start-speed"]) $("#route-" + id).readOnly = Boolean(last);
+  if (last) {
+    $("#route-start-time").value = last.time_s;
+    $("#route-start-speed").value = (last.speed_mps ?? actor.curve.speed_mps.at(-1) ?? 0) * 3.6;
+  } else if (state.routeHasPoint) {
+    const saved = actor?.trajectory_options?.routing_settings;
+    $("#route-start-time").value = saved?.start_time_s ?? 0;
+    $("#route-start-speed").value = (saved?.start_speed_mps ?? 30 / 3.6) * 3.6;
+  }
+  state.routeHasPoint = Boolean(last);
+  const available = vehicle && !settings.map_mode && Boolean($("#route-source").value === "lanelet2"
+    ? geo.lanelet_path : state.scenario.map.roads.length);
+  $("#route-mode").disabled = !available;
+  $("#route-mode").title = available ? "Append a route to the last waypoint" : "Choose an available map in Routing settings";
+  if (!available) state.routeMode = false;
+  $("#route-mode").checked = Boolean(state.routeMode);
+  $("#waypoint-timing").disabled = Boolean(state.routeMode);
+  $("#lane-snap").disabled = settings.map_mode || Boolean(state.routeMode);
+  if (state.routeMode || $("#routing-settings").open) updateRouteLanes();
 }
 
-async function geographicSetting(key, value) {
-  try { await api("/api/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [key]: value }) }); await refresh(); }
-  catch (error) { setStatus(error.message); }
+for (const key of ["show_lanelet", "show_xodr_origin", "show_lanelet_origin", "show_orthophoto"])
+  $("#" + key.replaceAll("_", "-")).onchange = (event) => updateSettings({ [key]: event.target.checked }, event.target);
+for (const key of ["orthophoto_opacity", "map_opacity", "lanelet_opacity"]) {
+  const slider = $("#" + key.replaceAll("_", "-"));
+  slider.oninput = () => { state.scenario.settings[key] = Number(slider.value); draw(); };
+  slider.onchange = () => updateSettings({ [key]: Number(slider.value) }, slider);
 }
-for (const key of ["show_lanelet", "show_origins", "show_orthophoto"]) $("#" + key.replaceAll("_", "-")).onchange = (event) => geographicSetting(key, event.target.checked);
-for (const key of ["orthophoto_opacity", "map_opacity"]) $("#" + key.replaceAll("_", "-")).onchange = (event) => geographicSetting(key, Number(event.target.value));
-$("#lanelet-load").onclick = () => $("#lanelet-upload").click();
 $("#lanelet-upload").onchange = async (event) => {
   const file = event.target.files[0]; if (!file) return;
   const data = new FormData(); data.append("file", file);
@@ -61,7 +98,8 @@ $("#lanelet-upload").onchange = async (event) => {
   finally { event.target.value = ""; }
 };
 $("#lanelet-remove").onclick = async () => {
-  try { await api("/api/lanelet", { method: "DELETE" }); await refresh(); } catch (error) { setStatus(error.message); }
+  try { await api("/api/lanelet", { method: "DELETE" }); await refresh(); renderMapLoadOptions(); setStatus("Lanelet2 removed"); }
+  catch (error) { setStatus(error.message); }
 };
 $("#frame-apply").onclick = async () => {
   const frame = { ...state.scenario.geodata.frame, crs: $("#frame-crs").value };
@@ -71,23 +109,26 @@ $("#frame-apply").onclick = async () => {
 };
 
 function drawGeographicLayers(context, view, transform) {
-  if (state.scenario.settings.show_lanelet) {
+  const settings = state.scenario.settings;
+  if (settings.show_lanelet) {
+    context.save(); context.globalAlpha = settings.lanelet_opacity;
     context.lineWidth = 1; context.strokeStyle = "#13847b";
     for (const lane of visibleLayerItems("lanelet", state.lanelet || [], view)) {
       drawPolyline(context, lane.left, transform); drawPolyline(context, lane.right, transform);
       context.save(); context.setLineDash([4, 4]); context.strokeStyle = "#d36a08";
       drawPolyline(context, lane.centerline, transform); context.restore();
     }
+    context.restore();
   }
-  if (state.scenario.settings.show_origins && state.scenario.geodata.frame) {
-    context.strokeStyle = "#bd184b"; context.fillStyle = "#bd184b";
-    const mark = (point, label) => {
-      const [x, y] = transform(point); context.beginPath(); context.moveTo(x - 8, y); context.lineTo(x + 8, y);
-      context.moveTo(x, y - 8); context.lineTo(x, y + 8); context.stroke(); drawLabel(context, x, y, label, "#bd184b");
-    };
-    mark([0, 0], "Working frame origin");
-    if (state.lanelet?.length) mark(state.scenario.geodata.lanelet_origin.point, "Lanelet2 projection origin (near map)");
-  }
+  const mark = (point, label, opacity) => {
+    context.save(); context.globalAlpha = opacity;
+    context.strokeStyle = "#bd184b"; context.fillStyle = "#bd184b"; context.lineWidth = 1;
+    const [x, y] = transform(point); context.beginPath(); context.moveTo(x - 8, y); context.lineTo(x + 8, y);
+    context.moveTo(x, y - 8); context.lineTo(x, y + 8); context.stroke(); drawLabel(context, x, y, label, "#bd184b"); context.restore();
+  };
+  if (settings.show_map && settings.show_xodr_origin && state.scenario.map.roads.length) mark([0, 0], "XODR origin", settings.map_opacity);
+  if (settings.show_lanelet && settings.show_lanelet_origin && state.scenario.geodata.lanelet_origin)
+    mark(state.scenario.geodata.lanelet_origin.point, "Lanelet2 projection origin", settings.lanelet_opacity);
 }
 
 function drawOrthophotos(context, view, transform) {
@@ -132,61 +173,94 @@ function drawOrthophotos(context, view, transform) {
   }
 }
 
-function clearRoutePreview() {
-  state.routePreview = null; $("#route-apply").disabled = true; $("#route-summary").textContent = "";
+function routingValues() {
+  const values = { source: $("#route-source").value, lane_id: $("#route-lane").value };
+  for (const [key, [id, divisor]] of Object.entries(routeFields)) {
+    const field = $("#route-" + id);
+    if (!field.value.trim() || !Number.isFinite(Number(field.value)) || Number(field.value) < Number(field.min))
+      throw new Error("Complete the speed profile with valid values.");
+    values[key] = Number(field.value) / divisor;
+  }
+  if (selectedActor()?.waypoints.length) {
+    const saved = selectedActor().trajectory_options?.routing_settings;
+    values.start_time_s = saved?.start_time_s ?? 0;
+    values.start_speed_mps = saved?.start_speed_mps ?? 30 / 3.6;
+  }
+  return values;
 }
-function routePoints() {
-  return $("#route-points").value.split("\n").filter((line) => line.trim()).map((line) => {
-    const values = line.split(",").map((v) => v.trim());
-    if (values.length < 2 || !values[0] || !values[1] || !Number.isFinite(Number(values[0])) || !Number.isFinite(Number(values[1]))) throw new Error("Each route point needs two numeric coordinates.");
-    const geographic = $("#route-coordinates").value === "geographic";
-    return { [geographic ? "lon" : "x_m"]: Number(values[0]), [geographic ? "lat" : "y_m"]: Number(values[1]), ...(values[2] ? { lane_id: values[2] } : {}) };
-  });
-}
-for (const kind of ["start", "via", "target"]) $("#route-pick-" + kind).onclick = () => {
-  state.routePick = kind; setStatus(`Select route ${kind} on the canvas`);
-};
-$("#route-pick-cancel").onclick = () => { state.routePick = null; setStatus("Route picking cancelled"); };
-function pickRoutePoint(x, y) {
-  if ($("#route-coordinates").value !== "local" && $("#route-points").value.trim()) { setStatus("Select local coordinates before picking points on the canvas"); return; }
-  $("#route-coordinates").value = "local";
-  const lines = $("#route-points").value.split("\n").filter((line) => line.trim());
-  const point = `${x.toFixed(3)}, ${y.toFixed(3)}`;
-  if (state.routePick === "start") { if (lines.length) lines[0] = point; else lines.push(point); }
-  else if (state.routePick === "target") { if (lines.length >= 2) lines[lines.length - 1] = point; else lines.push(point); }
-  else lines.splice(Math.max(1, lines.length - 1), 0, point);
-  $("#route-points").value = lines.join("\n"); state.routePick = null; clearRoutePreview(); draw(); setStatus("Route point selected");
-}
-$("#route-generator").addEventListener("input", clearRoutePreview);
-$("#route-preview").onclick = async () => {
-  const actor = selectedActor(); if (!actor) return;
+
+async function updateRouteLanes() {
+  const actor = selectedActor(), last = actor?.waypoints.at(-1), source = $("#route-source").value;
+  const key = `${actor?.name}|${state.scenario.geodata.revision}|${source}|${last?.x_m}|${last?.y_m}`;
+  if (state.routeLaneKey === key) return;
+  state.routeLaneKey = key;
+  const selected = actor?.trajectory_options?.routing_settings?.lane_id || "";
+  $("#route-lane").replaceChildren(new Option("Automatic", ""));
+  if (!last) return;
   try {
-    const parameters = {};
-    for (const [key, [id, divisor]] of Object.entries(routeFields)) {
-      const raw = $("#route-" + id).value;
-      if (!raw.trim()) throw new Error("Complete the speed profile fields.");
-      parameters[key] = Number(raw) / divisor;
-    }
-    setStatus("Calculating route...", true);
-    const preview = await api(`/api/actors/${actor.name}/route/preview`, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source: $("#route-source").value, points: routePoints(), parameters }) });
-    state.routePreview = preview; $("#route-apply").disabled = false;
-    $("#route-summary").textContent = `${preview.length_m.toFixed(1)} m; ${preview.duration_s.toFixed(2)} s; ${preview.lane_changes} lane changes. Confirm direction along lanes: ${preview.lane_ids.join(" → ")}`;
-    draw(); setStatus("Route preview ready; use the route to replace the selected actor's trajectory");
-  } catch (error) { clearRoutePreview(); setStatus(error.message); }
-};
-$("#route-apply").onclick = async () => {
-  const actor = selectedActor(), preview = state.routePreview; if (!actor || !preview) return;
+    const { lanes } = await api(`/api/actors/${encodeURIComponent(actor.name)}/route/lanes?source=${source}`);
+    if (state.routeLaneKey !== key) return;
+    state.routeLanes = lanes;
+    for (const lane of lanes) $("#route-lane").add(new Option(`${lane.lane_id} (${Math.round(lane.heading_rad * 180 / Math.PI)}°)`, lane.lane_id));
+    if (lanes.some((lane) => lane.lane_id === selected)) $("#route-lane").value = selected;
+    draw();
+  } catch (error) { if (state.routeLaneKey === key) $("#route-summary").textContent = error.message; }
+}
+
+async function saveRoutingSettings() {
   try {
-    await api(`/api/actors/${actor.name}/route/apply`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preview) });
-    clearRoutePreview(); await refresh(actor.name); setStatus("Route applied; its points and speeds are editable");
-  } catch (error) { clearRoutePreview(); setStatus(error.message); }
+    const actor = selectedActor(); if (!actor) return;
+    const values = routingValues();
+    await api(`/api/actors/${encodeURIComponent(actor.name)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ routing_settings: values }) });
+    await refresh();
+  } catch (error) { setStatus(error.message); }
+}
+for (const input of $("#routing-settings").querySelectorAll("input, select")) input.onchange = () => {
+  if (input.id === "route-source") { cancelRouteQueue(); state.routeLaneKey = null; updateRouteLanes(); }
+  saveRoutingSettings(); draw();
 };
+$("#routing-settings").ontoggle = () => { if ($("#routing-settings").open) updateRouteLanes(); };
+$("#route-mode").onchange = () => {
+  cancelRouteQueue(); state.routeMode = $("#route-mode").checked;
+  if (state.routeMode) { clearMeasurement(); setStatus("Route mode: click targets to extend the selected vehicle's trajectory"); }
+  renderGeodata(); draw();
+};
+
+async function appendRouteTarget(x_m, y_m) {
+  const actorName = selectedActor()?.name, epoch = state.routeEpoch, mapRevision = state.scenario.geodata.revision;
+  let values;
+  try { values = routingValues(); } catch (error) { $("#route-summary").textContent = error.message; setStatus(error.message); return; }
+  const dt = state.scenario.settings.time_step_s;
+  state.routePending = (state.routePending || 0) + 1;
+  setStatus("Calculating route...", true);
+  try {
+    const result = await api(`/api/actors/${encodeURIComponent(actorName)}/route/append`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      prepare: () => {
+        if (!state.routeMode || state.routeEpoch !== epoch || state.selected !== actorName
+            || state.scenario.settings.map_mode || state.scenario.geodata.revision !== mapRevision) return null;
+        return { body: JSON.stringify({ source: values.source, lane_id: values.lane_id, target: { x_m, y_m },
+          parameters: { ...values, dt_s: dt }, actor_revision: selectedActor().revision, map_revision: mapRevision }) };
+      },
+    });
+    if (!result) return;
+    await refresh();
+    if (state.routeEpoch !== epoch) return;
+    const route = result.route;
+    $("#route-summary").textContent = route.seeded ? "Start set. Click the next target."
+      : `${route.length_m.toFixed(1)} m; ${route.duration_s.toFixed(2)} s; ${route.lane_changes} lane changes; ${route.lane_ids.join(" → ")}`;
+    setStatus(route.seeded ? "Route start set" : "Route appended; click the next target");
+  } catch (error) {
+    if (state.routeEpoch === epoch) { cancelRouteQueue(); $("#route-summary").textContent = error.message; setStatus(error.message); }
+  } finally { state.routePending -= 1; }
+}
+
 function drawRoutePreview(context, transform) {
-  if (!state.routePreview) return;
-  context.save(); context.lineWidth = 4; context.strokeStyle = "#b31864";
-  drawPolyline(context, state.routePreview.points, transform);
-  const p = state.routePreview.points;
-  if (p.length > 1) { context.fillStyle = "#b31864"; drawArrow(context, transform(p[0]), transform(p[Math.min(4, p.length - 1)])); }
+  if (!state.routeMode) return;
+  const last = selectedActor()?.waypoints.at(-1); if (!last) return;
+  const lane = state.routeLanes?.find((lane) => lane.lane_id === $("#route-lane").value);
+  context.save(); context.strokeStyle = "#b31864"; context.fillStyle = "#b31864"; context.lineWidth = 2;
+  const start = transform([last.x_m, last.y_m]); context.beginPath(); context.arc(...start, 7, 0, Math.PI * 2); context.stroke();
+  if (lane) drawArrow(context, start, [start[0] + 25 * Math.cos(lane.heading_rad), start[1] - 25 * Math.sin(lane.heading_rad)]);
   context.restore();
 }
